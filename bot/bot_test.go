@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -95,9 +96,9 @@ func TestGenerator(t *testing.T) {
 	if validSkin([]byte("nope")) {
 		t.Fatal("garbage accepted")
 	}
-	g := NewGenerator("python3", "../skin_papercraft.py", "tg: @faustyu", 2)
+	g := NewGenerator("python3", "../skin_papercraft.py", "../bbmodel_papercraft.py", "tg: @faustyu", 2)
 	for _, model := range []string{"auto", "alex"} {
-		res, err := g.Run(context.Background(), skin, model, "separate")
+		res, err := g.Run(context.Background(), kindSkin, skin, model, "separate")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -108,6 +109,76 @@ func TestGenerator(t *testing.T) {
 		if res.Model != want {
 			t.Fatalf("model %s: got %s", model, res.Model)
 		}
+	}
+}
+
+// testModel returns the smallest .bbmodel next to the bot, to keep the test fast.
+func testModel(t *testing.T) []byte {
+	t.Helper()
+	paths, _ := filepath.Glob("../*.bbmodel")
+	var best []byte
+	for _, p := range paths {
+		if data, err := os.ReadFile(p); err == nil && (best == nil || len(data) < len(best)) {
+			best = data
+		}
+	}
+	if best == nil {
+		t.Skip("no ../*.bbmodel available")
+	}
+	return best
+}
+
+func TestModelGenerator(t *testing.T) {
+	model := testModel(t)
+	if n, err := checkModel(model); err != nil || n == 0 {
+		t.Fatalf("test model rejected: %d %v", n, err)
+	}
+	g := NewGenerator("python3", "../skin_papercraft.py", "../bbmodel_papercraft.py", "tg: @faustyu", 2)
+	res, err := g.Run(context.Background(), kindModel, model, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(res.PDF, []byte("%PDF")) || len(res.PNGs) < 2 {
+		t.Fatalf("bad output: %d page(s)", len(res.PNGs))
+	}
+}
+
+func TestCheckModel(t *testing.T) {
+	const tex = `"textures": [{"source": "data:image/png;base64,AAAA"}]`
+	for in, want := range map[string]error{
+		`not json`:           errNotModel,
+		`{"elements": [{}]}`: errNotModel,
+		`{"meta": {}, "elements": [], ` + tex + `}`:                                          errNoCubes,
+		`{"meta": {}, "elements": [{"type": "cube"}, {"type": "mesh"}], ` + tex + `}`:        errMesh,
+		`{"meta": {}, "elements": [{}]}`:                                                     errNoTexture,
+		`{"meta": {}, "elements": [{}], "textures": [{"source": ""}]}`:                       errLinkedTexture,
+		`{"meta": {}, "elements": [{"type": "cube"}, {"type": "locator"}, {}], ` + tex + `}`: nil,
+	} {
+		if _, err := checkModel([]byte(in)); err != want {
+			t.Errorf("checkModel(%s) = %v, want %v", in, err, want)
+		}
+	}
+}
+
+func TestStoreKind(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenStore(filepath.Join(t.TempDir(), "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.SaveDraft(ctx, &Draft{UserID: 1, Kind: kindModel, Title: "m", Skin: []byte("{}"), Format: "pdf"}); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := s.Draft(ctx, 1); d == nil || d.Kind != kindModel {
+		t.Fatalf("draft kind: %+v", d)
+	}
+	c := &Craft{UserID: 1, Title: "s", Skin: []byte{1}, Model: "steve", Layers: "none"}
+	if err := s.AddCraft(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Craft(ctx, c.ID); got.Kind != kindSkin {
+		t.Fatalf("craft kind defaults to skin: %+v", got)
 	}
 }
 
@@ -129,5 +200,32 @@ func TestFetchSkin(t *testing.T) {
 	}
 	if _, _, _, err := FetchSkin(context.Background(), "zz_no_such_user_zz"); err != errNoSkin {
 		t.Fatalf("missing user: %v", err)
+	}
+}
+
+func TestStoreMigratesOldDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bot.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(schema); err != nil { // the schema before the kind columns
+
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO crafts (user_id, title, skin, model, layers, created_at) VALUES (1, 'old', x'01', 'steve', 'none', 0)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	for range 2 { // the second start must not trip over the added columns
+		s, err := OpenStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, _ := s.Craft(context.Background(), 1)
+		s.Close()
+		if c == nil || c.Kind != kindSkin {
+			t.Fatalf("old craft: %+v", c)
+		}
 	}
 }

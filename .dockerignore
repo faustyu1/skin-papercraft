@@ -1,6 +1,7 @@
 *
 !Dockerfile
 !skin_papercraft.py
+!bbmodel_papercraft.py
 !bot/
 bot/*.db*
 bot/*_test.go

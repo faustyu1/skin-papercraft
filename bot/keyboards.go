@@ -46,6 +46,13 @@ func choiceRow(field string, options [][2]string, current string) []telego.Inlin
 }
 
 func draftKeyboard(d *Draft) *telego.InlineKeyboardMarkup {
+	if d.Kind == kindModel {
+		return tu.InlineKeyboard(
+			choiceRow("format", formatButtons, d.Format),
+			tu.InlineKeyboardRow(button(btnGenerate, "gen")),
+			tu.InlineKeyboardRow(button(btnCancel, "cancel")),
+		)
+	}
 	return tu.InlineKeyboard(
 		choiceRow("model", modelButtons, d.Model),
 		choiceRow("layers", layerButtons, d.Layers),

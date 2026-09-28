@@ -13,10 +13,11 @@ RUN apt-get update \
  && useradd --system --uid 10001 bot \
  && mkdir /data && chown bot /data
 WORKDIR /app
-COPY skin_papercraft.py ./
+COPY skin_papercraft.py bbmodel_papercraft.py ./
 COPY --from=build /out/skinbot ./
 ENV DB_PATH=/data/bot.db \
     GENERATOR=/app/skin_papercraft.py \
+    MODEL_GENERATOR=/app/bbmodel_papercraft.py \
     PYTHON=python3
 USER bot
 VOLUME /data

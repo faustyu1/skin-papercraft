@@ -67,9 +67,10 @@ func main() {
 	}
 
 	app := &App{
-		bot:    bot,
-		store:  store,
-		gen:    NewGenerator(env("PYTHON", "python3"), env("GENERATOR", "../skin_papercraft.py"), env("CREDIT", "tg: @faustyu"), jobs),
+		bot:   bot,
+		store: store,
+		gen: NewGenerator(env("PYTHON", "python3"), env("GENERATOR", "../skin_papercraft.py"),
+			env("MODEL_GENERATOR", "../bbmodel_papercraft.py"), env("CREDIT", "tg: @faustyu"), jobs),
 		admins: admins,
 	}
 	bh.HandleMessage(app.onStart, th.CommandEqual("start"))

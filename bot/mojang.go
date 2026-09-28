@@ -18,6 +18,8 @@ var (
 	errNoSkin       = errors.New("player or skin not found")
 	mojangClient    = &http.Client{Timeout: 10 * time.Second}
 	maxSkinDownload = int64(1 << 20)
+	// Blockbench models carry their textures inside, as base64.
+	maxModelDownload = int64(10 << 20)
 )
 
 // FetchSkin downloads a Java Edition player's current skin by nickname.

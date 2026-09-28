@@ -64,20 +64,17 @@ func (a *App) onMessage(ctx *th.Context, msg telego.Message) error {
 
 func (a *App) onDocument(ctx context.Context, user *User, msg telego.Message) error {
 	doc := msg.Document
+	if strings.EqualFold(filepath.Ext(doc.FileName), ".bbmodel") {
+		return a.onModel(ctx, user, msg)
+	}
 	if !strings.EqualFold(filepath.Ext(doc.FileName), ".png") && doc.MimeType != "image/png" {
 		return a.send(ctx, msg.Chat.ID, textNotPNG, backKeyboard())
 	}
 	if int64(doc.FileSize) > maxSkinDownload {
 		return a.send(ctx, msg.Chat.ID, textTooBig, backKeyboard())
 	}
-	file, err := a.bot.GetFile(ctx, &telego.GetFileParams{FileID: doc.FileID})
+	data, err := a.download(ctx, doc.FileID)
 	if err != nil {
-		log.Printf("get file: %v", err)
-		return a.send(ctx, msg.Chat.ID, textDownloadErr, backKeyboard())
-	}
-	data, err := tu.DownloadFile(a.bot.FileDownloadURL(file.FilePath))
-	if err != nil {
-		log.Printf("download file: %v", err)
 		return a.send(ctx, msg.Chat.ID, textDownloadErr, backKeyboard())
 	}
 	if !validSkin(data) {
@@ -85,6 +82,52 @@ func (a *App) onDocument(ctx context.Context, user *User, msg telego.Message) er
 	}
 	title := strings.TrimSuffix(doc.FileName, filepath.Ext(doc.FileName))
 	return a.startDraft(ctx, user, msg.Chat.ID, title, data, "auto")
+}
+
+var modelErrors = map[error]string{
+	errNotModel:      textModelNotModel,
+	errNoCubes:       textModelNoCubes,
+	errMesh:          textModelMesh,
+	errNoTexture:     textModelNoTexture,
+	errLinkedTexture: textModelLinked,
+}
+
+// onModel takes a Blockbench .bbmodel file sent as a document.
+func (a *App) onModel(ctx context.Context, user *User, msg telego.Message) error {
+	doc := msg.Document
+	if int64(doc.FileSize) > maxModelDownload {
+		return a.send(ctx, msg.Chat.ID, textModelTooBig, backKeyboard())
+	}
+	data, err := a.download(ctx, doc.FileID)
+	if err != nil {
+		return a.send(ctx, msg.Chat.ID, textDownloadErr, backKeyboard())
+	}
+	cubes, err := checkModel(data)
+	if err != nil {
+		return a.send(ctx, msg.Chat.ID, modelErrors[err], backKeyboard())
+	}
+	title := cleanTitle(strings.TrimSuffix(doc.FileName, filepath.Ext(doc.FileName)))
+	d := &Draft{UserID: user.ID, Kind: kindModel, Title: title, Skin: data, Layers: user.Layers, Format: user.Format}
+	if err := a.store.SaveDraft(ctx, d); err != nil {
+		return err
+	}
+	if err := a.store.SetState(ctx, user.ID, ""); err != nil {
+		return err
+	}
+	return a.send(ctx, msg.Chat.ID, fmt.Sprintf(textModelDraft, title, cubes), draftKeyboard(d))
+}
+
+func (a *App) download(ctx context.Context, fileID string) ([]byte, error) {
+	file, err := a.bot.GetFile(ctx, &telego.GetFileParams{FileID: fileID})
+	if err != nil {
+		log.Printf("get file: %v", err)
+		return nil, err
+	}
+	data, err := tu.DownloadFile(a.bot.FileDownloadURL(file.FilePath))
+	if err != nil {
+		log.Printf("download file: %v", err)
+	}
+	return data, err
 }
 
 func (a *App) onNick(ctx context.Context, user *User, msg telego.Message) error {
@@ -117,7 +160,7 @@ func (a *App) onNick(ctx context.Context, user *User, msg telego.Message) error 
 
 func (a *App) startDraft(ctx context.Context, user *User, chatID int64, title string, skin []byte, model string) error {
 	title = cleanTitle(title)
-	d := &Draft{UserID: user.ID, Title: title, Skin: skin, Model: model, Layers: user.Layers, Format: user.Format}
+	d := &Draft{UserID: user.ID, Kind: kindSkin, Title: title, Skin: skin, Model: model, Layers: user.Layers, Format: user.Format}
 	if err := a.store.SaveDraft(ctx, d); err != nil {
 		return err
 	}
@@ -238,6 +281,9 @@ func (a *App) onSet(ctx context.Context, user *User, chatID int64, msg *telego.M
 		answer(textNoDraft)
 		return nil
 	}
+	if d.Kind == kindModel && field != "format" {
+		return nil
+	}
 	switch field {
 	case "model":
 		d.Model = value
@@ -254,7 +300,23 @@ func (a *App) onSet(ctx context.Context, user *User, chatID int64, msg *telego.M
 			return err
 		}
 	}
-	return a.replace(ctx, chatID, msg, fmt.Sprintf(textDraft, d.Title), draftKeyboard(d))
+	return a.replace(ctx, chatID, msg, draftText(d), draftKeyboard(d))
+}
+
+func draftText(d *Draft) string {
+	if d.Kind == kindModel {
+		cubes, _ := checkModel(d.Skin)
+		return fmt.Sprintf(textModelDraft, d.Title, cubes)
+	}
+	return fmt.Sprintf(textDraft, d.Title)
+}
+
+// caption describes a craft under its files and on its card.
+func caption(c *Craft) string {
+	if c.Kind == kindModel {
+		return fmt.Sprintf(textModelInfo, c.Title)
+	}
+	return fmt.Sprintf(textSkinInfo, c.Title, modelNames[c.Model], layerNames[c.Layers])
 }
 
 func (a *App) onGenerate(ctx context.Context, user *User, chatID int64, msg *telego.Message, answer func(string)) error {
@@ -282,12 +344,16 @@ func (a *App) onGenerate(ctx context.Context, user *User, chatID int64, msg *tel
 		return err
 	}
 
-	res, err := a.gen.Run(ctx, d.Skin, d.Model, d.Layers)
+	res, err := a.gen.Run(ctx, d.Kind, d.Skin, d.Model, d.Layers)
 	if err != nil {
 		log.Printf("generate for %d: %v", user.ID, err)
-		return a.edit(ctx, chatID, status.MessageID, textGenFailed, backKeyboard())
+		failed := textGenFailed
+		if d.Kind == kindModel {
+			failed = textModelFailed
+		}
+		return a.edit(ctx, chatID, status.MessageID, failed, backKeyboard())
 	}
-	c := &Craft{UserID: user.ID, Title: d.Title, Skin: d.Skin, Model: res.Model, Layers: d.Layers}
+	c := &Craft{UserID: user.ID, Kind: d.Kind, Title: d.Title, Skin: d.Skin, Model: res.Model, Layers: d.Layers}
 	if err := a.store.AddCraft(ctx, c); err != nil {
 		return err
 	}
@@ -295,8 +361,11 @@ func (a *App) onGenerate(ctx context.Context, user *User, chatID int64, msg *tel
 		return err
 	}
 
-	caption := fmt.Sprintf(textResult, c.Title, modelNames[c.Model], layerNames[c.Layers])
-	if err := a.sendFiles(ctx, chatID, c, d.Format, caption, resultKeyboard(c), res); err != nil {
+	text := caption(c) + textPrint
+	if res.Detailed {
+		text += textModelDetailed
+	}
+	if err := a.sendFiles(ctx, chatID, c, d.Format, text, resultKeyboard(c), res); err != nil {
 		log.Printf("send files for %d: %v", user.ID, err)
 		return a.edit(ctx, chatID, status.MessageID, textGenFailed, backKeyboard())
 	}
@@ -372,15 +441,15 @@ func (a *App) showCard(ctx context.Context, user *User, chatID int64, msg *teleg
 		return a.replace(ctx, chatID, msg, empty, backKeyboard())
 	}
 
-	caption := fmt.Sprintf(textCard, c.Title, modelNames[c.Model], layerNames[c.Layers], c.CreatedAt.Format("02.01.2006"))
+	text := caption(c) + fmt.Sprintf(textCardDate, c.CreatedAt.Format("02.01.2006"))
 	if list == listMy {
-		caption += fmt.Sprintf(textCardPublic, yesNo[c.Public])
+		text += fmt.Sprintf(textCardPublic, yesNo[c.Public])
 	}
 	kb := cardKeyboard(list, c, offset, total, a.admins[user.ID])
 
 	photo, uploaded := tu.FileFromID(c.PreviewFileID), false
 	if c.PreviewFileID == "" {
-		res, err := a.gen.Run(ctx, c.Skin, c.Model, c.Layers)
+		res, err := a.gen.Run(ctx, c.Kind, c.Skin, c.Model, c.Layers)
 		if err != nil {
 			return err
 		}
@@ -390,7 +459,7 @@ func (a *App) showCard(ctx context.Context, user *User, chatID int64, msg *teleg
 	var sent *telego.Message
 	if msg != nil && len(msg.Photo) > 0 {
 		sent, err = a.bot.EditMessageMedia(ctx, tu.EditMessageMedia(tu.ID(chatID), msg.MessageID,
-			tu.MediaPhoto(photo).WithCaption(caption)).WithReplyMarkup(kb))
+			tu.MediaPhoto(photo).WithCaption(text)).WithReplyMarkup(kb))
 		if isNotModified(err) {
 			return nil
 		}
@@ -398,7 +467,7 @@ func (a *App) showCard(ctx context.Context, user *User, chatID int64, msg *teleg
 		if msg != nil && msg.Text != "" {
 			a.deleteMessage(ctx, chatID, msg.MessageID)
 		}
-		sent, err = a.bot.SendPhoto(ctx, tu.Photo(tu.ID(chatID), photo).WithCaption(caption).WithReplyMarkup(kb))
+		sent, err = a.bot.SendPhoto(ctx, tu.Photo(tu.ID(chatID), photo).WithCaption(text).WithReplyMarkup(kb))
 	}
 	if err != nil {
 		return err
@@ -426,7 +495,7 @@ func (a *App) sendFiles(ctx context.Context, chatID int64, c *Craft, format, cap
 	} else {
 		if res == nil {
 			var err error
-			if res, err = a.gen.Run(ctx, c.Skin, c.Model, c.Layers); err != nil {
+			if res, err = a.gen.Run(ctx, c.Kind, c.Skin, c.Model, c.Layers); err != nil {
 				return err
 			}
 		}

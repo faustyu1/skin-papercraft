@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -45,6 +46,18 @@ CREATE INDEX IF NOT EXISTS crafts_user   ON crafts (user_id, id);
 CREATE INDEX IF NOT EXISTS crafts_public ON crafts (public, published_at);
 `
 
+// Columns added after the first release; existing databases get them on start.
+var migrations = []string{
+	`ALTER TABLE drafts ADD COLUMN kind TEXT NOT NULL DEFAULT 'skin'`,
+	`ALTER TABLE crafts ADD COLUMN kind TEXT NOT NULL DEFAULT 'skin'`,
+}
+
+// What a draft or craft was made from. Blockbench models are kept in the skin column.
+const (
+	kindSkin  = "skin"
+	kindModel = "model"
+)
+
 type User struct {
 	ID     int64
 	State  string
@@ -54,6 +67,7 @@ type User struct {
 
 type Draft struct {
 	UserID int64
+	Kind   string
 	Title  string
 	Skin   []byte
 	Model  string
@@ -64,6 +78,7 @@ type Draft struct {
 type Craft struct {
 	ID            int64
 	UserID        int64
+	Kind          string
 	Title         string
 	Skin          []byte
 	Model         string
@@ -93,6 +108,11 @@ func OpenStore(path string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("init schema: %w", err)
+	}
+	for _, m := range migrations {
+		if _, err := db.Exec(m); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return nil, fmt.Errorf("migrate: %w", err)
+		}
 	}
 	return &Store{db: db}, nil
 }
@@ -127,10 +147,10 @@ func (s *Store) SetPref(ctx context.Context, id int64, field, value string) erro
 
 func (s *Store) SaveDraft(ctx context.Context, d *Draft) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO drafts (user_id, title, skin, model, layers, format, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (user_id) DO UPDATE SET title = excluded.title, skin = excluded.skin, model = excluded.model,
-			layers = excluded.layers, format = excluded.format, updated_at = excluded.updated_at`,
-		d.UserID, d.Title, d.Skin, d.Model, d.Layers, d.Format, time.Now().Unix())
+		INSERT INTO drafts (user_id, kind, title, skin, model, layers, format, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (user_id) DO UPDATE SET kind = excluded.kind, title = excluded.title, skin = excluded.skin,
+			model = excluded.model, layers = excluded.layers, format = excluded.format, updated_at = excluded.updated_at`,
+		d.UserID, kindOf(d.Kind), d.Title, d.Skin, d.Model, d.Layers, d.Format, time.Now().Unix())
 	return err
 }
 
@@ -138,8 +158,8 @@ func (s *Store) SaveDraft(ctx context.Context, d *Draft) error {
 func (s *Store) Draft(ctx context.Context, userID int64) (*Draft, error) {
 	d := &Draft{UserID: userID}
 	err := s.db.QueryRowContext(ctx,
-		`SELECT title, skin, model, layers, format FROM drafts WHERE user_id = ?`, userID).
-		Scan(&d.Title, &d.Skin, &d.Model, &d.Layers, &d.Format)
+		`SELECT kind, title, skin, model, layers, format FROM drafts WHERE user_id = ?`, userID).
+		Scan(&d.Kind, &d.Title, &d.Skin, &d.Model, &d.Layers, &d.Format)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -154,8 +174,8 @@ func (s *Store) DeleteDraft(ctx context.Context, userID int64) error {
 func (s *Store) AddCraft(ctx context.Context, c *Craft) error {
 	c.CreatedAt = time.Now()
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO crafts (user_id, title, skin, model, layers, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		c.UserID, c.Title, c.Skin, c.Model, c.Layers, c.CreatedAt.Unix())
+		`INSERT INTO crafts (user_id, kind, title, skin, model, layers, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		c.UserID, kindOf(c.Kind), c.Title, c.Skin, c.Model, c.Layers, c.CreatedAt.Unix())
 	if err != nil {
 		return err
 	}
@@ -163,12 +183,12 @@ func (s *Store) AddCraft(ctx context.Context, c *Craft) error {
 	return err
 }
 
-const craftColumns = `id, user_id, title, skin, model, layers, public, pdf_file_id, png_file_ids, preview_file_id, created_at`
+const craftColumns = `id, user_id, kind, title, skin, model, layers, public, pdf_file_id, png_file_ids, preview_file_id, created_at`
 
 func scanCraft(row interface{ Scan(...any) error }) (*Craft, error) {
 	c := &Craft{}
 	var created int64
-	err := row.Scan(&c.ID, &c.UserID, &c.Title, &c.Skin, &c.Model, &c.Layers, &c.Public,
+	err := row.Scan(&c.ID, &c.UserID, &c.Kind, &c.Title, &c.Skin, &c.Model, &c.Layers, &c.Public,
 		&c.PDFFileID, &c.PNGFileIDs, &c.PreviewFileID, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -215,6 +235,13 @@ func (s *Store) SetFileIDs(ctx context.Context, id int64, format, ids string) er
 	}
 	_, err := s.db.ExecContext(ctx, `UPDATE crafts SET `+column+` = ? WHERE id = ?`, ids, id)
 	return err
+}
+
+func kindOf(kind string) string {
+	if kind == "" {
+		return kindSkin
+	}
+	return kind
 }
 
 func (s *Store) DeleteCraft(ctx context.Context, id int64) error {
