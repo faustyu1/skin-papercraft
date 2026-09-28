@@ -92,6 +92,11 @@ func (g *Generator) run(ctx context.Context, input []byte, name string, timeout 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return nil, nil, errTooSlow
 	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && strings.Contains(exit.Error(), "signal: killed") {
+		// Not our timeout, so the kernel stopped it: the server ran out of memory.
+		return nil, nil, fmt.Errorf("%w: %s", errOutOfMemory, log)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("generator: %w: %s", err, log)
 	}
@@ -131,8 +136,10 @@ func validSkin(data []byte) bool {
 	return w >= 64 && w <= 1024 && w%64 == 0 && (h == w || h == w/2)
 }
 
-// errTooSlow: the generator ran out of time.
-var errTooSlow = errors.New("generator timed out")
+var (
+	errTooSlow     = errors.New("generator timed out")
+	errOutOfMemory = errors.New("generator killed, out of memory")
+)
 
 // Reasons a Blockbench file cannot be turned into a papercraft.
 var (

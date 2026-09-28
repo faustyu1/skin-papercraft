@@ -572,18 +572,28 @@ def render(skin, pixel_mm, dpi, layers, force_slim, credit):
     return [p for p, _ in pages], slim
 
 
-def save_pdf(pages, path, dpi):
-    """Lossless multi-page PDF (Pillow's writer uses JPEG, which smears pixel art)."""
-    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", None]
-    kids = []
-    for page in pages:
+class PdfWriter:
+    """Lossless PDF (Pillow's writer uses JPEG, which smears pixel art), built one page at
+    a time so finished pages do not have to stay in memory."""
+
+    def __init__(self, dpi):
+        self.dpi = dpi
+        self.objects = [b"<< /Type /Catalog /Pages 2 0 R >>", None]
+        self.kids = []
+
+    def add(self, page):
         w, h = page.size
-        pw, ph = w * 72 / dpi, h * 72 / dpi
-        data = zlib.compress(page.convert("RGB").tobytes(), 6)
+        pw, ph = w * 72 / self.dpi, h * 72 / self.dpi
+        # Compressed in strips: the whole page as bytes would be another 26 MB at 300 dpi.
+        page = page if page.mode == "RGB" else page.convert("RGB")
+        z, data = zlib.compressobj(6), []
+        for y in range(0, h, 256):
+            data.append(z.compress(page.crop((0, y, w, min(h, y + 256))).tobytes()))
+        data = b"".join(data) + z.flush()
         content = f"q {pw:.2f} 0 0 {ph:.2f} 0 0 cm /Im0 Do Q".encode()
-        n = len(objects) + 1  # object number of this page
-        kids.append(f"{n} 0 R")
-        objects += [
+        n = len(self.objects) + 1  # object number of this page
+        self.kids.append(f"{n} 0 R")
+        self.objects += [
             f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {pw:.2f} {ph:.2f}] "
             f"/Resources << /XObject << /Im0 {n + 1} 0 R >> >> /Contents {n + 2} 0 R >>".encode(),
             f"<< /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceRGB "
@@ -591,18 +601,27 @@ def save_pdf(pages, path, dpi):
             + data + b"\nendstream",
             f"<< /Length {len(content)} >>\nstream\n".encode() + content + b"\nendstream",
         ]
-    objects[1] = f"<< /Type /Pages /Kids [{' '.join(kids)}] /Count {len(kids)} >>".encode()
 
-    out = bytearray(b"%PDF-1.4\n")
-    offsets = []
-    for i, obj in enumerate(objects, 1):
-        offsets.append(len(out))
-        out += f"{i} 0 obj\n".encode() + obj + b"\nendobj\n"
-    xref = len(out)
-    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
-    out += b"".join(f"{o:010d} 00000 n \n".encode() for o in offsets)
-    out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
-    Path(path).write_bytes(out)
+    def save(self, path):
+        objects = self.objects[:]
+        objects[1] = f"<< /Type /Pages /Kids [{' '.join(self.kids)}] /Count {len(self.kids)} >>".encode()
+        with open(path, "wb") as f:
+            f.write(b"%PDF-1.4\n")
+            offsets = []
+            for i, obj in enumerate(objects, 1):
+                offsets.append(f.tell())
+                f.write(f"{i} 0 obj\n".encode() + obj + b"\nendobj\n")
+            xref = f.tell()
+            f.write(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode())
+            f.write(b"".join(f"{o:010d} 00000 n \n".encode() for o in offsets))
+            f.write(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+
+
+def save_pdf(pages, path, dpi):
+    pdf = PdfWriter(dpi)
+    for page in pages:
+        pdf.add(page)
+    pdf.save(path)
 
 
 MODELS = {"auto": None, "steve": False, "alex": True}

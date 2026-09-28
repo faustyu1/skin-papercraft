@@ -13,6 +13,7 @@ every piece numbered, use it as the assembly reference.
 Pieces hidden inside another cube and watermark elements are skipped.
 """
 import argparse
+from array import array
 import base64
 import io
 import json
@@ -24,11 +25,10 @@ from pathlib import Path
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 from skin_papercraft import (
-    ALPHA_CUTOFF, blank_page, build_net, cell_rows, dashed_line, load_font, pack, page_geometry, save_pdf,
+    ALPHA_CUTOFF, PdfWriter, blank_page, build_net, cell_rows, dashed_line, load_font, pack, page_geometry,
 )
 
 # Texels per model unit when a face texture is resampled for print or preview.
-SAMPLE = 16
 WATERMARK = re.compile(r"watermark|вотермарк|ватермарк", re.I)
 EPS = 1e-6
 
@@ -92,6 +92,17 @@ def hidden_inside(e, others, clear=frozenset()):
         if all(ol <= l + EPS and h <= oh + EPS for l, h, ol, oh in zip(lo, hi, olo, ohi)) and (lo, hi) != (olo, ohi):
             return True
     return False
+
+
+def texel_size(textures, face):
+    """Size of a face's texture region in texture pixels, as the face is oriented: the
+    preview needs no more, and big models would take gigabytes at a fixed density."""
+    if not face or face.get("texture") is None or not face.get("uv"):
+        return 1, 1
+    _, sx, sy = textures[face["texture"]]
+    u0, v0, u1, v1 = face["uv"]
+    w, h = max(1, round(abs(u1 - u0) * sx)), max(1, round(abs(v1 - v0) * sy))
+    return (w, h) if face.get("rotation", 0) % 180 == 0 else (h, w)
 
 
 def face_image(textures, face, w, h):
@@ -170,7 +181,7 @@ def render_preview(elements, textures, size, yaw=30, pitch=-20):
     """Orthographic render of the model seen from the front, a bit from the left and above.
 
     Returns (image, owner): owner[y * size + x] is the index of the element seen at
-    that pixel, or None.
+    that pixel, or -1.
     """
     view = mat_mul(rot_matrix((pitch, 0, 0)), rot_matrix((0, yaw, 0)))
     # The camera looks from -Z (the front); +X is on the viewer's left.
@@ -183,7 +194,8 @@ def render_preview(elements, textures, size, yaw=30, pitch=-20):
             fw, fh = dims[name]
             if fw < EPS or fh < EPS:
                 continue
-            img = face_image(textures, e["faces"].get(name), max(1, round(fw * SAMPLE)), max(1, round(fh * SAMPLE)))
+            face = e["faces"].get(name)
+            img = face_image(textures, face, *texel_size(textures, face))
             if img is not None:
                 quads.append(([cam(to_world(e, c)) for c in corners], img, index))
     if not quads:
@@ -197,9 +209,10 @@ def render_preview(elements, textures, size, yaw=30, pitch=-20):
 
     # Plain z-buffer: faces of thin decals sit a hair above other faces, painter's
     # sorting gets those wrong.
-    color = [(255, 255, 255)] * (size * size)
-    depth = [math.inf] * (size * size)
-    owner = [None] * (size * size)
+    # Flat arrays: lists of tuples for a 1000 px view would take ~100 MB.
+    color = bytearray(b"\xff") * (3 * size * size)
+    depth = array("d", [math.inf]) * (size * size)
+    owner = array("i", [-1]) * (size * size)
     for pts, img, index in quads:
         (ax, ay), (bx, by), (lx, ly) = (screen(p) for p in pts)
         az, bz, lz = (p[2] for p in pts)
@@ -231,10 +244,8 @@ def render_preview(elements, textures, size, yaw=30, pitch=-20):
                 if al >= 128:
                     depth[k] = z
                     owner[k] = index
-                    color[k] = (int(r * shade), int(g * shade), int(b * shade))
-    canvas = Image.new("RGB", (size, size))
-    canvas.putdata(color)
-    return canvas, owner
+                    color[3 * k:3 * k + 3] = bytes((int(r * shade), int(g * shade), int(b * shade)))
+    return Image.frombytes("RGB", (size, size), bytes(color)), owner
 
 
 # ---------------------------------------------------------------- pieces
@@ -332,8 +343,9 @@ def clear_cube(e, textures):
     dims = face_dims(e)
     if min(size_of(e)) < LAYER_MIN:
         return False
-    for name, (fw, fh) in dims.items():
-        img = face_image(textures, e["faces"].get(name), max(1, round(fw * SAMPLE)), max(1, round(fh * SAMPLE)))
+    for name in dims:
+        face = e["faces"].get(name)
+        img = face_image(textures, face, *texel_size(textures, face))
         if see_through(img):
             return True
     return False
@@ -987,25 +999,31 @@ def legend_page(elements, numbers, textures, dpi, credit):
 
     # Put every number on the view where most of that piece is seen, at the middle of
     # what is seen; pieces hidden in both views are skipped.
-    seen = [[[] for _ in elements] for _ in views]
+    # Per view and piece: pixels seen, their x and y sums, and every 7th pixel as a
+    # candidate spot for the mark.
+    seen = [[[0, 0, 0, []] for _ in elements] for _ in views]
     for v, (_, owner, _) in enumerate(views):
         for k, index in enumerate(owner):
-            if index is not None:
-                seen[v][index].append(k)
+            if index >= 0:
+                st = seen[v][index]
+                if st[0] % 7 == 0:
+                    st[3].append(k)
+                st[0] += 1
+                st[1] += k % size
+                st[2] += k // size
     r = round(2.2 * mm)
     marks = []
     for i, e in enumerate(elements):
-        v = max(range(len(views)), key=lambda v: len(seen[v][i]))
-        pixels = seen[v][i]
-        if not pixels:
+        v = max(range(len(views)), key=lambda v: seen[v][i][0])
+        count, sx, sy, pixels = seen[v][i]
+        if not count:
             continue
         # The seen pixel closest to their mean keeps the mark on the piece for L-shapes;
         # pixels where the mark would cover another mark are tried last.
-        mx = sum(k % size for k in pixels) / len(pixels)
-        my = sum(k // size for k in pixels) / len(pixels)
+        mx, my = sx / count, sy / count
         clash = lambda k: sum(max(0, 2 * r - math.hypot(views[v][2] + k % size - X, top + k // size - Y))
                               for X, Y in marks)
-        k = min(pixels[::7] or pixels, key=lambda k: (clash(k) * 50) ** 2 + (k % size - mx) ** 2 + (k // size - my) ** 2)
+        k = min(pixels, key=lambda k: (clash(k) * 50) ** 2 + (k % size - mx) ** 2 + (k // size - my) ** 2)
         X, Y = views[v][2] + k % size, top + k // size
         marks.append((X, Y))
         draw.ellipse((X - r, Y - r, X + r, Y + r), fill="white", outline="black", width=max(2, round(0.2 * mm)))
@@ -1084,7 +1102,11 @@ def fit_unit(extent, limit):
     return max(min(lx / a, ly / b), min(lx / b, ly / a))
 
 
-def render(path, unit_mm, dpi, credit):
+def render(path, unit_mm, dpi, credit, emit=None):
+    """Pages of the papercraft and the scale used. With `emit`, every page is handed to it
+    as soon as it is done instead of being returned: an A4 page at 300 dpi is 26 MB."""
+    pages = []
+    emit = emit or pages.append
     elements, textures = load_model(path)
     kept = []
     for e in elements:
@@ -1142,16 +1164,18 @@ def render(path, unit_mm, dpi, credit):
     cell = max(4, round(px_mm))  # ~1 mm grid
     gap = 2
     credit_px = round(2.5 * px_mm)
-    pages = []
     while sprites:
         page, taken = blank_page(dpi, credit, credit_px)
         occ, _, _ = cell_rows(taken, cell)
+        del taken
         before = len(sprites)
         sprites = pack(page, occ, sprites, cell, gap)
         if len(sprites) == before:
             sys.exit("  a piece is bigger than a whole page")
-        pages.append(page)
-    pages += legend_page(visible, numbers, textures, dpi, credit)
+        emit(page)
+        del page
+    for page in legend_page(visible, numbers, textures, dpi, credit):
+        emit(page)
     return pages, unit_mm
 
 
@@ -1167,16 +1191,21 @@ def main():
 
     credit = " · ".join(filter(None, [args.credit, args.author and f"модель: {args.author}"]))
     for path in map(Path, args.models):
-        pages, unit = render(path, args.unit_mm, args.dpi, credit)
         out_dir = args.out_dir or path.parent
         out_dir.mkdir(parents=True, exist_ok=True)
         stem = out_dir / f"{path.stem}_papercraft"
-        pngs = [stem.with_suffix(".png")] + [out_dir / f"{stem.name}_page{i}.png" for i in range(2, len(pages) + 1)]
-        for page, png in zip(pages, pngs):
+        pdf, pngs = PdfWriter(args.dpi), []
+
+        def emit(page):
+            png = stem.with_suffix(".png") if not pngs else out_dir / f"{stem.name}_page{len(pngs) + 1}.png"
             page.save(png, dpi=(args.dpi, args.dpi), compress_level=3)
-        save_pdf(pages, stem.with_suffix(".pdf"), args.dpi)
+            pdf.add(page)
+            pngs.append(png)
+
+        _, unit = render(path, args.unit_mm, args.dpi, credit, emit)
+        pdf.save(stem.with_suffix(".pdf"))
         files = ", ".join(p.name for p in pngs + [stem.with_suffix(".pdf")])
-        print(f"{path.name}: unit {unit} mm, {len(pages)} page(s) -> {files}")
+        print(f"{path.name}: unit {unit} mm, {len(pngs)} page(s) -> {files}")
 
 
 if __name__ == "__main__":

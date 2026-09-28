@@ -351,6 +351,8 @@ func (a *App) onGenerate(ctx context.Context, user *User, chatID int64, msg *tel
 		switch {
 		case d.Kind == kindModel && errors.Is(err, errTooSlow):
 			failed = textModelSlow
+		case errors.Is(err, errOutOfMemory):
+			failed = textOutOfMemory
 		case d.Kind == kindModel:
 			failed = textModelFailed
 		}
