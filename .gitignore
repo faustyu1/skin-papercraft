@@ -1,0 +1,16 @@
+# Secrets and local data
+.env
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+
+# Generated papercraft output
+*_papercraft.png
+*_papercraft_page*.png
+*_papercraft.pdf
+
+# Local Blockbench models
+*.bbmodel
