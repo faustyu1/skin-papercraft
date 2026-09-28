@@ -89,6 +89,9 @@ func (g *Generator) run(ctx context.Context, input []byte, name string, timeout 
 	defer cancel()
 	args = append([]string{script, in, "--credit", g.credit, "--out-dir", out}, args...)
 	log, err := exec.CommandContext(ctx, g.python, args...).CombinedOutput()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return nil, nil, errTooSlow
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("generator: %w: %s", err, log)
 	}
@@ -127,6 +130,9 @@ func validSkin(data []byte) bool {
 	w, h := cfg.Width, cfg.Height
 	return w >= 64 && w <= 1024 && w%64 == 0 && (h == w || h == w/2)
 }
+
+// errTooSlow: the generator ran out of time.
+var errTooSlow = errors.New("generator timed out")
 
 // Reasons a Blockbench file cannot be turned into a papercraft.
 var (

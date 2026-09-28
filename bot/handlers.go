@@ -348,7 +348,10 @@ func (a *App) onGenerate(ctx context.Context, user *User, chatID int64, msg *tel
 	if err != nil {
 		log.Printf("generate for %d: %v", user.ID, err)
 		failed := textGenFailed
-		if d.Kind == kindModel {
+		switch {
+		case d.Kind == kindModel && errors.Is(err, errTooSlow):
+			failed = textModelSlow
+		case d.Kind == kindModel:
 			failed = textModelFailed
 		}
 		return a.edit(ctx, chatID, status.MessageID, failed, backKeyboard())

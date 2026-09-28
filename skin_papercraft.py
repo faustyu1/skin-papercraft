@@ -400,13 +400,51 @@ def dilate(rows, w, h, gap):
     return out, w + 2 * gap, h + 2 * gap
 
 
+def runs(row):
+    """Runs of set bits in a mask row as (first bit, length)."""
+    out, bit = [], 0
+    while row:
+        skip = (row & -row).bit_length() - 1
+        row >>= skip
+        bit += skip
+        length = (~row & (row + 1)).bit_length() - 1
+        out.append((bit, length))
+        row >>= length
+        bit += length
+    return out
+
+
+def smear(v, n):
+    """OR of v >> k for k in 0..n-1, in log(n) steps."""
+    done = 1
+    while done < n:
+        step = min(done, n - done)
+        v |= v >> step
+        done += step
+    return v
+
+
 def first_fit(occ, grid_w, grid_h, rows, w, h):
-    """Top-most, then left-most spot where the piece overlaps nothing."""
+    """Top-most, then left-most spot where the piece overlaps nothing.
+
+    For each y, one bit mask marks every x the piece cannot start at: a run of piece
+    bits [b, b+n) at row i is blocked wherever occ[y+i] has a bit in [x+b, x+b+n).
+    """
+    if w > grid_w or h > grid_h:
+        return None
+    xs = (1 << (grid_w - w + 1)) - 1
+    shape = [(i, runs(r)) for i, r in enumerate(rows) if r]
     for y in range(grid_h - h + 1):
-        window = occ[y:y + h]
-        for x in range(grid_w - w + 1):
-            if not any(o & (r << x) for o, r in zip(window, rows)):
-                return x, y
+        blocked = 0
+        for i, row_runs in shape:
+            o = occ[y + i]
+            for bit, n in row_runs:
+                blocked |= smear(o >> bit, n)
+            if blocked & xs == xs:
+                break
+        free = ~blocked & xs
+        if free:
+            return (free & -free).bit_length() - 1, y
     return None
 
 
@@ -541,7 +579,7 @@ def save_pdf(pages, path, dpi):
     for page in pages:
         w, h = page.size
         pw, ph = w * 72 / dpi, h * 72 / dpi
-        data = zlib.compress(page.convert("RGB").tobytes(), 9)
+        data = zlib.compress(page.convert("RGB").tobytes(), 6)
         content = f"q {pw:.2f} 0 0 {ph:.2f} 0 0 cm /Im0 Do Q".encode()
         n = len(objects) + 1  # object number of this page
         kids.append(f"{n} 0 R")

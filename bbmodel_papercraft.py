@@ -81,11 +81,12 @@ def is_rotated(obj):
     return any(abs(r) > EPS for r in obj.get("rotation") or (0, 0, 0))
 
 
-def hidden_inside(e, others):
-    """A cube fully enclosed by another cube of the same group is never seen."""
+def hidden_inside(e, others, clear=frozenset()):
+    """A cube fully enclosed by another opaque cube of the same group is never seen.
+    Cubes in `clear` (ids of see-through cubes, like a skin's outer layer) hide nothing."""
     lo, hi = box(e)
     for o in others:
-        if o is e or o["groups"] != e["groups"] or is_rotated(o) or is_rotated(e):
+        if o is e or id(o) in clear or o["groups"] != e["groups"] or is_rotated(o) or is_rotated(e):
             continue
         olo, ohi = box(o)
         if all(ol <= l + EPS and h <= oh + EPS for l, h, ol, oh in zip(lo, hi, olo, ohi)) and (lo, hi) != (olo, ohi):
@@ -131,12 +132,25 @@ def apply(m, p, origin=(0, 0, 0)):
     return tuple(sum(m[i][k] * q[k] for k in range(3)) + origin[i] for i in range(3))
 
 
+def transform(e):
+    """The cube rotation, then every parent group rotation, innermost first, folded into
+    one rotation m and offset t (world = m·p + t). Computed once per cube."""
+    if "_xf" not in e:
+        m, t = [[1, 0, 0], [0, 1, 0], [0, 0, 1]], (0, 0, 0)
+        for obj in [e] + e["groups"][::-1]:
+            if is_rotated(obj):
+                r, o = rot_matrix(obj["rotation"]), obj.get("origin", (0, 0, 0))
+                m = mat_mul(r, m)
+                t = apply(r, t, o)
+        e["_xf"] = (m, t)
+    return e["_xf"]
+
+
 def to_world(e, p):
-    """Apply the cube rotation, then every parent group rotation, innermost first."""
-    for obj in [e] + e["groups"][::-1]:
-        if is_rotated(obj):
-            p = apply(rot_matrix(obj["rotation"]), p, obj.get("origin", (0, 0, 0)))
-    return p
+    (a, b, c), t = transform(e)
+    return (a[0] * p[0] + a[1] * p[1] + a[2] * p[2] + t[0],
+            b[0] * p[0] + b[1] * p[1] + b[2] * p[2] + t[1],
+            c[0] * p[0] + c[1] * p[1] + c[2] * p[2] + t[2])
 
 
 def face_corners(e):
@@ -313,6 +327,46 @@ def see_through(img):
     return img is not None and img.getchannel("A").getextrema()[0] < ALPHA_CUTOFF
 
 
+def clear_cube(e, textures):
+    """A solid cube with see-through texture somewhere: an outer layer, a cage, glass."""
+    dims = face_dims(e)
+    if min(size_of(e)) < LAYER_MIN:
+        return False
+    for name, (fw, fh) in dims.items():
+        img = face_image(textures, e["faces"].get(name), max(1, round(fw * SAMPLE)), max(1, round(fh * SAMPLE)))
+        if see_through(img):
+            return True
+    return False
+
+
+def wrapped(e, others, tol=0.05):
+    """Biggest cube that e's box encloses, if e is an outer layer around it."""
+    lo, hi = world_box(e)
+    inner = [o for o in others if o is not e and not o.get("over")
+             and all(lo[i] - tol <= a and b <= hi[i] + tol for i, (a, b) in enumerate(zip(*world_box(o))))
+             and min(size_of(o)) >= LAYER_MIN]
+    return max(inner, key=lambda o: math.prod(size_of(o)), default=None)
+
+
+# Outer layers and what they wrap are real cubes, not decals: at least this thick (units).
+LAYER_MIN = 0.5
+
+FACE_WORDS = {"north": "перед", "south": "зад", "east": "право", "west": "лево", "up": "верх", "down": "низ"}
+
+
+def overlay_pieces(e, textures, unit, px_mm, dpi, label):
+    """An outer layer (hat, jacket, sleeves) printed as one cut-out per face, glued flat
+    over the matching face of the cube inside, like the second layer of a skin."""
+    pieces = []
+    for name, (fw, fh) in face_dims(e).items():
+        w, h = fw * unit, fh * unit
+        img = sample(textures, e["faces"].get(name), w, h, px_mm)
+        if img is None or img.getchannel("A").getextrema()[1] < ALPHA_CUTOFF:
+            continue
+        pieces.append(cutout_piece(img, w, h, px_mm, dpi, f"{label} {FACE_WORDS[name]}", flap=False))
+    return pieces
+
+
 def plane_piece(e, textures, unit, px_mm, dpi, label, axis):
     first, second, side_by_side = PLANE_FACES[axis]
     dims = face_dims(e)
@@ -361,7 +415,7 @@ def plane_piece(e, textures, unit, px_mm, dpi, label, axis):
     return [sheet.img]
 
 
-def cutout_piece(img, w, h, px_mm, dpi, label, seg=None):
+def cutout_piece(img, w, h, px_mm, dpi, label, seg=None, flap=True):
     """A see-through plane cut along its shape, with a glue flap on the edge that most
     of the shape touches (hair, fins, antennae grow from that edge), or on `seg`
     (p0, p1, centre of the shape) when the piece was cut off along a line."""
@@ -383,7 +437,7 @@ def cutout_piece(img, w, h, px_mm, dpi, label, seg=None):
         if nx * (p0[0] - cx) + ny * (p0[1] - cy) < 0:
             nx, ny = -nx, -ny
         glue, fold = flap_poly(p0, p1, (nx, ny)), (p0, p1)
-    elif touch[best] > 0 and alpha.getbbox() != (0, 0, W, H):
+    elif flap and touch[best] > 0 and alpha.getbbox() != (0, 0, W, H):
         _, (p0, p1), normal = edges[best]
         glue, fold = flap_poly(p0, p1, normal), (p0, p1)
 
@@ -423,6 +477,8 @@ def flap_poly(p0, p1, normal, depth=3):
 
 
 def element_pieces(e, textures, unit, px_mm, dpi, label):
+    if e.get("over"):
+        return overlay_pieces(e, textures, unit, px_mm, dpi, label)
     lo, hi = box(e)
     # Cubes thinner than paper are printed as planes.
     flat = [i for i in range(3) if (hi[i] - lo[i]) * unit < THIN_MM]
@@ -469,12 +525,10 @@ def v_unit(a):
 
 
 def to_local(e, p):
-    """Inverse of to_world."""
-    for obj in e["groups"] + [e]:
-        if is_rotated(obj):
-            m = rot_matrix(obj["rotation"])
-            p = apply([[m[j][i] for j in range(3)] for i in range(3)], p, obj.get("origin", (0, 0, 0)))
-    return p
+    """Inverse of to_world: the rotation is orthonormal, so its inverse is its transpose."""
+    m, t = transform(e)
+    q = (p[0] - t[0], p[1] - t[1], p[2] - t[2])
+    return tuple(m[0][i] * q[0] + m[1][i] * q[1] + m[2][i] * q[2] for i in range(3))
 
 
 NORMALS = {"north": (0, 0, -1), "south": (0, 0, 1), "east": (1, 0, 0), "west": (-1, 0, 0),
@@ -543,9 +597,11 @@ def key(p):
 
 
 def world_box(e):
-    lo, hi = box(e)
-    pts = [to_world(e, (x, y, z)) for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])]
-    return [min(p[i] for p in pts) for i in range(3)], [max(p[i] for p in pts) for i in range(3)]
+    if "_wb" not in e:
+        lo, hi = box(e)
+        pts = [to_world(e, (x, y, z)) for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])]
+        e["_wb"] = [min(p[i] for p in pts) for i in range(3)], [max(p[i] for p in pts) for i in range(3)]
+    return e["_wb"]
 
 
 def planes_in(e, other):
@@ -883,6 +939,8 @@ def base_of(e, others, tol=0.05):
 def piece_note(e, numbers):
     """(к N): glue the hatched face onto piece N; (N° к M): the piece is turned by N
     degrees against piece M it sits on."""
+    if e.get("over"):
+        return f"(поверх {numbers[id(e['over'])]}) " if id(e["over"]) in numbers else ""
     if e.get("plane_cut") and e.get("base"):
         return f"(к {numbers[id(e['base'])]}) "
     if e.get("cut"):
@@ -959,7 +1017,9 @@ def legend_page(elements, numbers, textures, dpi, credit):
              "печатаются лицом и изнанкой: склейте их спинками, клапаны разведите в стороны "
              "и приклейте к фигурке. Заштрихованная грань — скошенный срез: в списке «(к N)», "
              "приклейте её к детали N, и деталь сама встанет под нужным углом. «(N° к M)» — деталь "
-             "повёрнута на столько градусов относительно детали M, наклон смотрите на картинке.")
+             "повёрнута на столько градусов относительно детали M, наклон смотрите на картинке. "
+             "«(поверх N)» — внешний слой: вырежьте его грани по контуру (подписаны перед, зад, лево, право, "
+             "верх, низ) и наклейте поверх граней детали N.")
     words, line = notes.split(), ""
     for w in words:
         if draw.textlength(line + " " + w, font=small) > page_w - 2 * margin:
@@ -1034,7 +1094,8 @@ def render(path, unit_mm, dpi, credit):
             continue
         else:
             kept.append(e)
-    visible = [e for e in kept if not hidden_inside(e, kept)]
+    clear = {id(e) for e in kept if clear_cube(e, textures)}
+    visible = [e for e in kept if not hidden_inside(e, kept, clear)]
     if len(visible) < len(kept):
         print(f"  skipped {len(kept) - len(visible)} cube(s) hidden inside others", file=sys.stderr)
 
@@ -1054,10 +1115,15 @@ def render(path, unit_mm, dpi, credit):
         hint = ("the biggest piece limits the scale, the model is too detailed for A4" if fit < unit_mm + 0.05
                 else "try a bigger --unit-mm")
         print(f"  {tiny} piece(s) have edges under 2 mm, hard to cut: {hint}", file=sys.stderr)
+    # See-through cubes around other cubes are outer layers: printed as cut-outs glued
+    # over the cube inside, and left out of cutting cubes apart.
+    for e in visible:
+        if id(e) in clear:
+            e["over"] = wrapped(e, visible)
     whole = visible
     while True:
         # Cubes thinner than paper become planes, which depends on the scale.
-        buried = resolve_overlaps(whole, THIN_MM / unit_mm)
+        buried = resolve_overlaps([e for e in whole if not e.get("over")], THIN_MM / unit_mm)
         visible = [e for e in whole if all(e is not b for b in buried)]
         for e in visible:
             e["base"] = base_of(e, visible)
@@ -1107,7 +1173,7 @@ def main():
         stem = out_dir / f"{path.stem}_papercraft"
         pngs = [stem.with_suffix(".png")] + [out_dir / f"{stem.name}_page{i}.png" for i in range(2, len(pages) + 1)]
         for page, png in zip(pages, pngs):
-            page.save(png, dpi=(args.dpi, args.dpi))
+            page.save(png, dpi=(args.dpi, args.dpi), compress_level=3)
         save_pdf(pages, stem.with_suffix(".pdf"), args.dpi)
         files = ", ".join(p.name for p in pngs + [stem.with_suffix(".pdf")])
         print(f"{path.name}: unit {unit} mm, {len(pages)} page(s) -> {files}")
