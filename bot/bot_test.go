@@ -96,7 +96,7 @@ func TestGenerator(t *testing.T) {
 	if validSkin([]byte("nope")) {
 		t.Fatal("garbage accepted")
 	}
-	g := NewGenerator("python3", "../skin_papercraft.py", "../bbmodel_papercraft.py", "tg: @faustyu", 2)
+	g := NewGenerator("tg: @faustyu", 2)
 	for _, model := range []string{"auto", "alex"} {
 		res, err := g.Run(context.Background(), kindSkin, skin, model, "separate")
 		if err != nil {
@@ -133,7 +133,7 @@ func TestModelGenerator(t *testing.T) {
 	if n, err := checkModel(model); err != nil || n == 0 {
 		t.Fatalf("test model rejected: %d %v", n, err)
 	}
-	g := NewGenerator("python3", "../skin_papercraft.py", "../bbmodel_papercraft.py", "tg: @faustyu", 2)
+	g := NewGenerator("tg: @faustyu", 2)
 	res, err := g.Run(context.Background(), kindModel, model, "", "")
 	if err != nil {
 		t.Fatal(err)

@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -27,6 +28,13 @@ func main() {
 		log.Fatal("BOT_TOKEN is not set")
 	}
 	jobs, _ := strconv.Atoi(env("MAX_JOBS", "2"))
+	// Rendering churns through 35 MB page buffers; collect sooner and keep the heap
+	// under a soft ceiling scaled to the job count, unless GOMEMLIMIT says otherwise.
+	debug.SetGCPercent(50)
+	if os.Getenv("GOMEMLIMIT") == "" {
+		limit := int64(max(jobs, 1)*96+64) << 20
+		debug.SetMemoryLimit(limit)
+	}
 	admins := map[int64]bool{}
 	for _, id := range strings.Split(os.Getenv("ADMIN_IDS"), ",") {
 		if n, err := strconv.ParseInt(strings.TrimSpace(id), 10, 64); err == nil {
@@ -67,10 +75,9 @@ func main() {
 	}
 
 	app := &App{
-		bot:   bot,
-		store: store,
-		gen: NewGenerator(env("PYTHON", "python3"), env("GENERATOR", "../skin_papercraft.py"),
-			env("MODEL_GENERATOR", "../bbmodel_papercraft.py"), env("CREDIT", "tg: @faustyu"), jobs),
+		bot:    bot,
+		store:  store,
+		gen:    NewGenerator(env("CREDIT", "tg: @faustyu"), jobs),
 		admins: admins,
 	}
 	bh.HandleMessage(app.onStart, th.CommandEqual("start"))

@@ -5,19 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"image/png"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
+
+	"skinbot/papercraft"
 )
 
-// Generator runs skin_papercraft.py and bbmodel_papercraft.py, at most `jobs` at a time.
+// Generator turns skins and Blockbench models into papercraft pages, at most `jobs` at
+// a time, running entirely in-process.
 type Generator struct {
-	python, skinScript, modelScript, credit string
-	slots                                   chan struct{}
+	credit string
+	slots  chan struct{}
 }
 
 type Result struct {
@@ -27,9 +26,8 @@ type Result struct {
 	Detailed bool     // a Blockbench model has pieces too small to cut out comfortably
 }
 
-func NewGenerator(python, skinScript, modelScript, credit string, jobs int) *Generator {
-	return &Generator{python: python, skinScript: skinScript, modelScript: modelScript, credit: credit,
-		slots: make(chan struct{}, max(jobs, 1))}
+func NewGenerator(credit string, jobs int) *Generator {
+	return &Generator{credit: credit, slots: make(chan struct{}, max(jobs, 1))}
 }
 
 // Run makes a papercraft of a craft of either kind.
@@ -40,90 +38,112 @@ func (g *Generator) Run(ctx context.Context, kind string, data []byte, model, la
 	return g.RunSkin(ctx, data, model, layers)
 }
 
-func (g *Generator) RunSkin(ctx context.Context, skin []byte, model, layers string) (*Result, error) {
-	res, log, err := g.run(ctx, skin, "skin.png", 90*time.Second, g.skinScript, "--model", model, "--layers", layers)
+func (g *Generator) RunSkin(ctx context.Context, skinPNG []byte, model, layers string) (*Result, error) {
+	release, err := g.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	res.Model = "steve"
-	if bytes.Contains(log, []byte(": alex model")) {
-		res.Model = "alex"
+	defer release()
+
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	skin, err := papercraft.LoadSkin(skinPNG)
+	if err != nil {
+		return nil, err
 	}
-	return res, nil
+	var forceSlim *bool
+	switch model {
+	case "steve":
+		v := false
+		forceSlim = &v
+	case "alex":
+		v := true
+		forceSlim = &v
+	}
+	out := &Result{}
+	pdf := papercraft.NewPdfWriter(300)
+	emit := pageEncoder(ctx, out, pdf, 6)
+	slim, _, err := papercraft.RenderSkin(skin, 2.5, 300, layers, forceSlim, g.credit, emit)
+	if err != nil {
+		return nil, timeoutErr(ctx, err)
+	}
+	out.Model = "steve"
+	if slim {
+		out.Model = "alex"
+	}
+	return out, finishPDF(out, pdf, ctx)
 }
 
 // RunModel turns a Blockbench model into a papercraft. Big models take a while: every
 // pair of cubes that sink into each other is cut apart first.
 func (g *Generator) RunModel(ctx context.Context, model []byte) (*Result, error) {
-	res, log, err := g.run(ctx, model, "model.bbmodel", 3*time.Minute, g.modelScript)
+	release, err := g.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	res.Detailed = bytes.Contains(log, []byte("too detailed for A4"))
-	return res, nil
+	defer release()
+
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	out := &Result{}
+	pdf := papercraft.NewPdfWriter(300)
+	emit := pageEncoder(ctx, out, pdf, 3)
+	_, log, err := papercraft.RenderModel(model, 8, 300, g.credit, emit)
+	if err != nil {
+		return nil, timeoutErr(ctx, err)
+	}
+	out.Detailed = strings.Contains(log, "too detailed for A4")
+	return out, finishPDF(out, pdf, ctx)
 }
 
-// run writes the input as `name` and runs the script on it; the script writes
-// <stem>_papercraft.pdf and <stem>_papercraft[_pageN].png.
-func (g *Generator) run(ctx context.Context, input []byte, name string, timeout time.Duration,
-	script string, args ...string) (*Result, []byte, error) {
+func (g *Generator) acquire(ctx context.Context) (func(), error) {
 	select {
 	case g.slots <- struct{}{}:
-		defer func() { <-g.slots }()
+		return func() { <-g.slots }, nil
 	case <-ctx.Done():
-		return nil, nil, ctx.Err()
+		return nil, ctx.Err()
 	}
+}
 
-	dir, err := os.MkdirTemp("", "papercraft-")
-	if err != nil {
-		return nil, nil, err
-	}
-	defer os.RemoveAll(dir)
-
-	in, out := filepath.Join(dir, name), filepath.Join(dir, "out")
-	if err := os.WriteFile(in, input, 0o600); err != nil {
-		return nil, nil, err
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	args = append([]string{script, in, "--credit", g.credit, "--out-dir", out}, args...)
-	log, err := exec.CommandContext(ctx, g.python, args...).CombinedOutput()
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return nil, nil, errTooSlow
-	}
-	var exit *exec.ExitError
-	if errors.As(err, &exit) && strings.Contains(exit.Error(), "signal: killed") {
-		// Not our timeout, so the kernel stopped it: the server ran out of memory.
-		return nil, nil, fmt.Errorf("%w: %s", errOutOfMemory, log)
-	}
-	if err != nil {
-		return nil, nil, fmt.Errorf("generator: %w: %s", err, log)
-	}
-
-	base := filepath.Join(out, strings.TrimSuffix(name, filepath.Ext(name))+"_papercraft")
-	res := &Result{}
-	if res.PDF, err = os.ReadFile(base + ".pdf"); err != nil {
-		return nil, nil, err
-	}
-	for page := 1; ; page++ {
-		file := base + ".png"
-		if page > 1 {
-			file = fmt.Sprintf("%s_page%d.png", base, page)
+// pageEncoder turns each finished page into the PNG bytes the bot sends and appends the
+// lossless page to the PDF.
+func pageEncoder(ctx context.Context, res *Result, pdf *papercraft.PdfWriter, level int) func(*papercraft.Img) error {
+	return func(page *papercraft.Img) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
-		data, err := os.ReadFile(file)
-		if errors.Is(err, os.ErrNotExist) {
-			break
-		}
+		data, err := papercraft.SavePNG(page, 300, level)
 		if err != nil {
-			return nil, nil, err
+			return err
 		}
 		res.PNGs = append(res.PNGs, data)
+		pdf.Add(page)
+		return nil
 	}
-	if len(res.PNGs) == 0 {
-		return nil, nil, errors.New("generator produced no pages")
+}
+
+func finishPDF(res *Result, pdf *papercraft.PdfWriter, ctx context.Context) error {
+	var buf bytes.Buffer
+	if err := pdf.Write(&buf); err != nil {
+		return err
 	}
-	return res, log, nil
+	res.PDF = buf.Bytes()
+	return timeoutErr(ctx, nil)
+}
+
+func timeoutErr(ctx context.Context, err error) error {
+	if err == nil && ctx.Err() == nil {
+		return nil
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return errTooSlow
+	}
+	if err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 // validSkin checks that data is a PNG with Minecraft skin proportions.
