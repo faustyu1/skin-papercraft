@@ -8,8 +8,9 @@ Usage:
 Every cube becomes a box net (solid lines = cut, dashed = fold, white flaps = glue).
 Flat cubes (planes) become fold-over pieces: fold on the dashed line and glue the two
 halves back to back. Planes with see-through texture are cut out along their shape.
-Cube rotations are not part of the net: the last page shows the assembled model with
-every piece numbered, use it as the assembly reference.
+Cube rotations are not part of the net: the last pages show the assembled model with
+every piece numbered (models with too many pieces are split into zoomed parts), use
+them as the assembly reference.
 Pieces hidden inside another cube and watermark elements are skipped.
 """
 import argparse
@@ -177,8 +178,11 @@ def face_corners(e):
     }
 
 
-def render_preview(elements, textures, size, yaw=30, pitch=-20):
+def render_preview(elements, textures, size, yaw=30, pitch=-20, focus=None):
     """Orthographic render of the model seen from the front, a bit from the left and above.
+
+    With `focus` (two corners of a world-space box) only cubes touching the box are
+    drawn and the frame is fitted to it: a zoomed view of one part of a big model.
 
     Returns (image, owner): owner[y * size + x] is the index of the element seen at
     that pixel, or -1.
@@ -189,6 +193,10 @@ def render_preview(elements, textures, size, yaw=30, pitch=-20):
 
     quads = []
     for index, e in enumerate(elements):
+        if focus is not None:
+            elo, ehi = world_box(e)
+            if any(elo[i] > focus[1][i] or ehi[i] < focus[0][i] for i in range(3)):
+                continue
         dims = face_dims(e)
         for name, corners in face_corners(e).items():
             fw, fh = dims[name]
@@ -201,8 +209,13 @@ def render_preview(elements, textures, size, yaw=30, pitch=-20):
     if not quads:
         sys.exit("model has no textured faces")
 
-    xs = [p[0] for q, *_ in quads for p in q] + [q[1][0] + q[2][0] - q[0][0] for q, *_ in quads]
-    ys = [p[1] for q, *_ in quads for p in q] + [q[1][1] + q[2][1] - q[0][1] for q, *_ in quads]
+    if focus is not None:
+        pts = [cam((x, y, z)) for x in (focus[0][0], focus[1][0])
+               for y in (focus[0][1], focus[1][1]) for z in (focus[0][2], focus[1][2])]
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    else:
+        xs = [p[0] for q, *_ in quads for p in q] + [q[1][0] + q[2][0] - q[0][0] for q, *_ in quads]
+        ys = [p[1] for q, *_ in quads for p in q] + [q[1][1] + q[2][1] - q[0][1] for q, *_ in quads]
     scale = 0.92 * size / max(max(xs) - min(xs), max(ys) - min(ys))
     cx, cy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
     screen = lambda p: (size / 2 + (p[0] - cx) * scale, size / 2 + (p[1] - cy) * scale)
@@ -948,128 +961,136 @@ def base_of(e, others, tol=0.05):
     return min(touching, key=lambda o: tilt(e, o), default=None)
 
 
-def piece_note(e, numbers):
-    """(к N): glue the hatched face onto piece N; (N° к M): the piece is turned by N
-    degrees against piece M it sits on."""
-    if e.get("over"):
-        return f"(поверх {numbers[id(e['over'])]}) " if id(e["over"]) in numbers else ""
-    if e.get("plane_cut") and e.get("base"):
-        return f"(к {numbers[id(e['base'])]}) "
-    if e.get("cut"):
-        return f"(к {', '.join(str(numbers[id(o)]) for o in e['cut'][0] if id(o) in numbers)}) "
-    base = e.get("base")
-    angle = tilt(e, base) if base else tilt(e)
-    if angle < 3:
-        return ""
-    return f"({angle:.0f}° к {numbers[id(base)]}) " if base else f"({angle:.0f}°) "
+# Numbers stop being readable on one view past this many pieces: big models are split
+# into zoomed part pages instead.
+MAX_MARKS = 60
 
 
-def piece_name(e):
-    """Group path without the root group every model has, plus the size in model units."""
-    path = [g["name"] for g in e["groups"]]
-    if len(path) > 1:
-        path = path[1:]
-    if len(path) > 2:
-        path = [path[0], "…", path[-1]]
-    lo, hi = box(e)
-    dims = "×".join(f"{b - a:g}" for a, b in zip(lo, hi) if b - a > EPS)
-    return f"{'/'.join(path) or e.get('name', '')}  {dims}"
-
-
-def legend_page(elements, numbers, textures, dpi, credit):
-    """Assembly reference: the model from the front and from the back, pieces numbered."""
-    page_w, page_h, margin = page_geometry(dpi)
-    page = Image.new("RGB", (page_w, page_h), "white")
-    draw = ImageDraw.Draw(page)
-    mm = dpi / 25.4
-    font = load_font(round(3 * mm))
-    small = load_font(round(2.4 * mm))
-    if credit:
-        draw.text((margin, margin // 2), credit, fill="black", font=font, anchor="lm")
-    draw.text((margin, margin + round(2 * mm)), "Сборка", fill="black", font=load_font(round(5 * mm)), anchor="lm")
-
-    size = (page_w - 2 * margin - round(6 * mm)) // 2
-    top = margin + round(7 * mm)
-    views = []
-    for col, yaw in enumerate((30, 210)):
-        img, owner = render_preview(elements, textures, size, yaw=yaw)
-        x0 = margin + col * (size + round(6 * mm))
-        page.paste(img, (x0, top))
-        views.append((img, owner, x0))
-
-    # Put every number on the view where most of that piece is seen, at the middle of
-    # what is seen; pieces hidden in both views are skipped.
-    # Per view and piece: pixels seen, their x and y sums, and every 7th pixel as a
-    # candidate spot for the mark.
+def draw_marks(draw, views, indices, elements, numbers, small, r, line_w):
+    """Number every piece of `indices` on the view where most of it is seen; pieces hidden
+    in all views are skipped. `views` are (owner, size, x0, y0) of already pasted renders.
+    Per view and piece: pixels seen, their x and y sums, and every 7th pixel as a
+    candidate spot for the mark."""
+    wanted = set(indices)
     seen = [[[0, 0, 0, []] for _ in elements] for _ in views]
-    for v, (_, owner, _) in enumerate(views):
+    for v, (owner, size, _, _) in enumerate(views):
         for k, index in enumerate(owner):
-            if index >= 0:
+            if index >= 0 and index in wanted:
                 st = seen[v][index]
                 if st[0] % 7 == 0:
                     st[3].append(k)
                 st[0] += 1
                 st[1] += k % size
                 st[2] += k // size
-    r = round(2.2 * mm)
     marks = []
-    for i, e in enumerate(elements):
+    for i in indices:
         v = max(range(len(views)), key=lambda v: seen[v][i][0])
         count, sx, sy, pixels = seen[v][i]
         if not count:
             continue
         # The seen pixel closest to their mean keeps the mark on the piece for L-shapes;
         # pixels where the mark would cover another mark are tried last.
+        _, size, x0, y0 = views[v]
         mx, my = sx / count, sy / count
-        clash = lambda k: sum(max(0, 2 * r - math.hypot(views[v][2] + k % size - X, top + k // size - Y))
+        clash = lambda k: sum(max(0, 2 * r - math.hypot(x0 + k % size - X, y0 + k // size - Y))
                               for X, Y in marks)
         k = min(pixels, key=lambda k: (clash(k) * 50) ** 2 + (k % size - mx) ** 2 + (k // size - my) ** 2)
-        X, Y = views[v][2] + k % size, top + k // size
+        X, Y = x0 + k % size, y0 + k // size
         marks.append((X, Y))
-        draw.ellipse((X - r, Y - r, X + r, Y + r), fill="white", outline="black", width=max(2, round(0.2 * mm)))
-        draw.text((X, Y), str(numbers[id(e)]), fill="black", font=small, anchor="mm")
+        draw.ellipse((X - r, Y - r, X + r, Y + r), fill="white", outline="black", width=line_w)
+        draw.text((X, Y), str(numbers[id(elements[i])]), fill="black", font=small, anchor="mm")
 
-    y = top + size + round(6 * mm)
-    notes = ("Сплошные линии — резать, пунктир — сгибать, белые клапаны — клеить. "
-             "Плоские детали сгибаются пополам и склеиваются изнанкой; вырезные (волоски и т.п.) "
-             "печатаются лицом и изнанкой: склейте их спинками, клапаны разведите в стороны "
-             "и приклейте к фигурке. Заштрихованная грань — скошенный срез: в списке «(к N)», "
-             "приклейте её к детали N, и деталь сама встанет под нужным углом. «(N° к M)» — деталь "
-             "повёрнута на столько градусов относительно детали M, наклон смотрите на картинке. "
-             "«(поверх N)» — внешний слой: вырежьте его грани по контуру (подписаны перед, зад, лево, право, "
-             "верх, низ) и наклейте поверх граней детали N.")
-    words, line = notes.split(), ""
-    for w in words:
-        if draw.textlength(line + " " + w, font=small) > page_w - 2 * margin:
-            draw.text((margin, y), line, fill="black", font=small, anchor="lt")
-            y, line = y + round(3.6 * mm), w
-        else:
-            line = (line + " " + w).strip()
-    draw.text((margin, y), line, fill="black", font=small, anchor="lt")
 
-    # Piece list in three columns, continued on more pages when long.
+def legend_page(elements, numbers, textures, dpi, credit):
+    """Assembly reference: the assembled model from the front and from the back. Pieces
+    are numbered on the view where they are seen; when there are too many for the numbers
+    to stay readable, the overview is printed clean and the numbers move to zoomed parts."""
+    page_w, page_h, margin = page_geometry(dpi)
+    mm = dpi / 25.4
+    font = load_font(round(3 * mm))
+    small = load_font(round(2.4 * mm))
+    r = round(2.2 * mm)
+    line_w = max(2, round(0.2 * mm))
+    size = (page_w - 2 * margin - round(6 * mm)) // 2
+    gap = round(6 * mm)
+    top = margin + round(7 * mm)
+
+    def new_page(title):
+        page = Image.new("RGB", (page_w, page_h), "white")
+        draw = ImageDraw.Draw(page)
+        if credit:
+            draw.text((margin, margin // 2), credit, fill="black", font=font, anchor="lm")
+        if title:
+            draw.text((margin, margin + round(2 * mm)), title, fill="black",
+                      font=load_font(round(5 * mm)), anchor="lm")
+        return page, draw
+
+    def draw_notes(draw, y, parts=False):
+        notes = ("Сплошные линии — резать, пунктир — сгибать, белые клапаны — клеить. "
+                 "Плоские детали сгибаются пополам и склеиваются изнанкой; вырезные (волоски и т.п.) "
+                 "печатаются лицом и изнанкой: склейте их спинками, клапаны разведите в стороны "
+                 "и приклейте к фигурке. Номер на детали тот же, что на картинке, — по нему видно, "
+                 "куда она встаёт. Заштрихованная грань — скошенный срез: приклейте её к соседней "
+                 "детали, и деталь сама встанет под нужным углом. Внешние полупрозрачные слои "
+                 "вырезаются по граням (подписаны перед, зад, лево, право, верх, низ) и наклеиваются "
+                 "поверх детали на том же месте.")
+        if parts:
+            notes += (" Модель большая: на общем виде все номера не помещаются, ищите каждую "
+                      "деталь по частям на следующих страницах.")
+        words, line = notes.split(), ""
+        for w in words:
+            if draw.textlength(line + " " + w, font=small) > page_w - 2 * margin:
+                draw.text((margin, y), line, fill="black", font=small, anchor="lt")
+                y, line = y + round(3.6 * mm), w
+            else:
+                line = (line + " " + w).strip()
+        draw.text((margin, y), line, fill="black", font=small, anchor="lt")
+        return y
+
+    def pasted(page, y, focus=None):
+        views = []
+        for col, yaw in enumerate((30, 210)):
+            img, owner = render_preview(elements, textures, size, yaw=yaw, focus=focus)
+            x0 = margin + col * (size + gap)
+            page.paste(img, (x0, y))
+            views.append((owner, size, x0, y))
+        return views
+
+    if len(elements) <= MAX_MARKS:
+        page, draw = new_page("Сборка")
+        draw_marks(draw, pasted(page, top), range(len(elements)),
+                   elements, numbers, small, r, line_w)
+        draw_notes(draw, top + size + gap)
+        return [page]
+
+    # Too many pieces for one view: split the model along its longest axis into bands of
+    # a readable size, print the overview clean and number the pieces part by part.
+    lo = [min(world_box(e)[0][i] for e in elements) for i in range(3)]
+    hi = [max(world_box(e)[1][i] for e in elements) for i in range(3)]
+    axis = max(range(3), key=lambda i: hi[i] - lo[i])
+    order = sorted(range(len(elements)),
+                   key=lambda i: (world_box(elements[i])[0][axis] + world_box(elements[i])[1][axis]) / 2)
+    bands = [order[i:i + MAX_MARKS] for i in range(0, len(order), MAX_MARKS)]
+
+    page, draw = new_page("Сборка — общий вид")
+    pasted(page, top)
+    draw_notes(draw, top + size + gap, parts=True)
     pages = [page]
-    col_w = (page_w - 2 * margin) // 3
-    step = round(4 * mm)
-    y += round(8 * mm)
-    rows = (page_h - margin - y) // step
-    col = row = 0
-    for e in elements:
-        if row == rows:
-            col, row = col + 1, 0
-        if col == 3:
-            page = Image.new("RGB", (page_w, page_h), "white")
-            draw = ImageDraw.Draw(page)
-            if credit:
-                draw.text((margin, margin // 2), credit, fill="black", font=font, anchor="lm")
-            pages.append(page)
-            y, col, row = margin, 0, 0
-            rows = (page_h - 2 * margin) // step
-        text = f"{numbers[id(e)]}. {piece_note(e, numbers)}{piece_name(e)}"
-        while draw.textlength(text, font=small) > col_w - round(2 * mm):
-            text = text[:-2] + "…"
-        draw.text((margin + col * col_w, y + row * step), text, fill="black", font=small, anchor="lt")
-        row += 1
+
+    per_page = max(1, (page_h - top - margin) // (size + gap))
+    for p in range(0, len(bands), per_page):
+        first, last = p + 1, min(p + per_page, len(bands))
+        part = f"часть {first}" if first == last else f"части {first}–{last}"
+        page, draw = new_page(f"Сборка — {part} из {len(bands)}")
+        for row, band in enumerate(bands[p:p + per_page]):
+            blo = [min(world_box(elements[i])[0][k] for i in band) for k in range(3)]
+            bhi = [max(world_box(elements[i])[1][k] for i in band) for k in range(3)]
+            pad = 0.08  # a bit of the neighbouring bands stays in frame for context
+            focus = ([blo[k] - pad * (bhi[k] - blo[k]) for k in range(3)],
+                     [bhi[k] + pad * (bhi[k] - blo[k]) for k in range(3)])
+            views = pasted(page, top + row * (size + gap), focus)
+            draw_marks(draw, views, band, elements, numbers, small, r, line_w)
+        pages.append(page)
     return pages
 
 
