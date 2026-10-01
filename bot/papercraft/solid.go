@@ -390,15 +390,22 @@ func Unfold(solid Solid) ([][]PointF, []struct {
 	I, J int
 	K    edgeKey
 }) {
+	// Edges in first-seen order, like a Python dict: ties between equal fold lengths must
+	// break the same way every run.
 	edges := map[edgeKey][]int{}
+	var order []edgeKey
 	for i, f := range solid {
 		for s := range f.Pts {
 			k := makeEdgeKey(f.Pts[s], f.Pts[(s+1)%len(f.Pts)])
+			if _, ok := edges[k]; !ok {
+				order = append(order, k)
+			}
 			edges[k] = append(edges[k], i)
 		}
 	}
 	neighbours := make([][]foldEdge, len(solid))
-	for k, fs := range edges {
+	for _, k := range order {
+		fs := edges[k]
 		if len(fs) != 2 {
 			continue
 		}
