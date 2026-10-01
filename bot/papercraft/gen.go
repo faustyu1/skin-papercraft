@@ -173,11 +173,12 @@ func RenderModel(data []byte, unitMM float64, dpi int, credit string, emit func(
 	cell := max(4, int(math.Round(pxMM))) // ~1 mm grid
 	gap := 2
 	creditPx := int(math.Round(2.5 * pxMM))
+	packer := NewPacker(cell, gap)
 	for len(sprites) > 0 {
 		page, taken := BlankPage(dpi, credit, creditPx)
 		occ, _, _ := CellRows(taken, cell)
 		before := len(sprites)
-		sprites = Pack(page, occ, sprites, cell, gap)
+		sprites = packer.Pack(page, occ, sprites)
 		if len(sprites) == before {
 			return 0, log.String(), errors.New("a piece is bigger than a whole page")
 		}

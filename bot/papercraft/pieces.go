@@ -185,48 +185,35 @@ func planePiece(e *Element, textures []*Texture, unit, pxMM float64, label strin
 	if len(keep) == 0 {
 		return nil
 	}
+	if len(keep) == 1 {
+		// Painted on one side only: Blockbench and the game draw such a plane from both
+		// sides, so from behind it shows the same picture mirrored. Print that as the
+		// back instead of leaving the paper blank there. Mirrored across the fold, it
+		// lands on the front pixel for pixel, as seen from the other face.
+		other, back := pf.second, FlipV(keep[0].img)
+		if pf.sideBySide {
+			back = FlipH(keep[0].img)
+		}
+		if keep[0].name == pf.second {
+			other = pf.first
+		}
+		keep = append(keep, kept{back, other})
+		if other == pf.first {
+			keep[0], keep[1] = keep[1], keep[0]
+		}
+	}
 	corners := e.faceCorners()
-	if e.PlaneCut != nil {
-		// Part of the plane sinks into a solid piece: print only what stays outside and
-		// glue it on along the cut line.
-		poly3d := e.PlaneCut.Poly
+	if e.PlaneCuts != nil {
+		// Solid cubes cut through the plane: print only what stays outside them, part by
+		// part, each glued on along its cut line.
 		var pieces []*Img
-		for _, k := range keep {
-			tl, tr, bl := corners[k.name][0], corners[k.name][1], corners[k.name][2]
-			ux, vy := vSub(tr, tl), vSub(bl, tl)
-			st := func(q V3) (float64, float64) {
-				d := vSub(q, tl)
-				return vDot(d, ux) / vDot(ux, ux), vDot(d, vy) / vDot(vy, vy)
-			}
-			W, H := k.img.Rect.Dx(), k.img.Rect.Dy()
-			mask := NewGray(k.img.Bounds())
-			pts := make([]PointF, 0, len(poly3d))
-			for _, q := range poly3d {
-				a, b := st(q)
-				pts = append(pts, PointF{a * float64(W), b * float64(H)})
-			}
-			PolygonGray(mask, pts, 255)
-			img := Clone(k.img)
-			alpha := GrayAlpha(img)
-			mult := GrayMultiply(alpha, mask)
-			for i := range img.Pix {
-				if i%4 == 3 {
-					img.Pix[i] = mult.Pix[i/4]
+		for j, pc := range e.PlaneCuts {
+			name := partLabel(label, j)
+			for _, k := range keep {
+				if img := planeCutPiece(k.img, corners[k.name], pc, w, h, pxMM, name); img != nil {
+					pieces = append(pieces, img)
 				}
 			}
-			var seg *cutSeg
-			if e.PlaneCut.HasGlue {
-				a0, b0 := st(e.PlaneCut.Glue[0])
-				a1, b1 := st(e.PlaneCut.Glue[1])
-				var cx, cy float64
-				for _, q := range poly3d {
-					a, b := st(q)
-					cx, cy = cx+a, cy+b
-				}
-				cx, cy = cx/float64(len(poly3d)), cy/float64(len(poly3d))
-				seg = &cutSeg{PointF{a0 * w, b0 * h}, PointF{a1 * w, b1 * h}, PointF{cx * w, cy * h}}
-			}
-			pieces = append(pieces, cutoutPiece(img, w, h, pxMM, label, seg, true))
 		}
 		return pieces
 	}
@@ -265,6 +252,57 @@ func planePiece(e *Element, textures []*Texture, unit, pxMM float64, label strin
 		sheet.fold(PointF{dx, dy}, PointF{w, h})
 	}
 	return []*Img{sheet.img}
+}
+
+// partLabel numbers the extra parts of a piece cut in several: 12, 12-2, 12-3.
+func partLabel(label string, i int) string {
+	if i == 0 || label == "" {
+		return label
+	}
+	return fmt.Sprintf("%s-%d", label, i+1)
+}
+
+// planeCutPiece cuts the part pc out of a face image of a flat cube; corners are the
+// face's top-left, top-right and bottom-left corners. A part with nothing painted on it
+// gives nil.
+func planeCutPiece(face *Img, corners [3]V3, pc PlaneCut, w, h, pxMM float64, label string) *Img {
+	tl, tr, bl := corners[0], corners[1], corners[2]
+	ux, vy := vSub(tr, tl), vSub(bl, tl)
+	st := func(q V3) (float64, float64) {
+		d := vSub(q, tl)
+		return vDot(d, ux) / vDot(ux, ux), vDot(d, vy) / vDot(vy, vy)
+	}
+	W, H := face.Rect.Dx(), face.Rect.Dy()
+	mask := NewGray(face.Bounds())
+	pts := make([]PointF, 0, len(pc.Poly))
+	for _, q := range pc.Poly {
+		a, b := st(q)
+		pts = append(pts, PointF{a * float64(W), b * float64(H)})
+	}
+	PolygonGray(mask, pts, 255)
+	img := Clone(face)
+	mult := GrayMultiply(GrayAlpha(img), mask)
+	if _, hi := GrayExtrema(mult); hi < ALPHACutoff {
+		return nil
+	}
+	for i := range img.Pix {
+		if i%4 == 3 {
+			img.Pix[i] = mult.Pix[i/4]
+		}
+	}
+	var seg *cutSeg
+	if pc.HasGlue {
+		a0, b0 := st(pc.Glue[0])
+		a1, b1 := st(pc.Glue[1])
+		var cx, cy float64
+		for _, q := range pc.Poly {
+			a, b := st(q)
+			cx, cy = cx+a, cy+b
+		}
+		cx, cy = cx/float64(len(pc.Poly)), cy/float64(len(pc.Poly))
+		seg = &cutSeg{PointF{a0 * w, b0 * h}, PointF{a1 * w, b1 * h}, PointF{cx * w, cy * h}}
+	}
+	return cutoutPiece(img, w, h, pxMM, label, seg, true)
 }
 
 // FlapPoly is a glue flap as long as the whole edge, with slanted ends.
@@ -443,6 +481,9 @@ func ElementPieces(e *Element, textures []*Texture, unit, pxMM float64, label st
 	}
 	if e.Cut != nil {
 		if pieces := slantedPiece(e, *e.Cut, textures, unit, pxMM, label); pieces != nil {
+			for i, part := range e.Extra {
+				pieces = append(pieces, slantedPiece(e, part, textures, unit, pxMM, partLabel(label, i+1))...)
+			}
 			return pieces
 		}
 	}

@@ -299,11 +299,12 @@ func RenderSkin(skin *Img, pixelMM float64, dpi int, layers string, forceSlim *b
 
 	cell := max(4, int(math.Round(float64(dpi)/25.4)))
 	gap := 2
+	packer := NewPacker(cell, gap)
 	first := true
 	for {
 		occ, _, _ := CellRows(taken, cell)
 		before := len(sprites)
-		sprites = Pack(page, occ, sprites, cell, gap)
+		sprites = packer.Pack(page, occ, sprites)
 		if len(sprites) == 0 {
 			return slim, log, emit(page)
 		}

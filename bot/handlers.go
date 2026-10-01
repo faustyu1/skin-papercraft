@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"github.com/mymmrac/telego"
@@ -25,6 +26,8 @@ type App struct {
 	gen    *Generator
 	admins map[int64]bool
 	busy   sync.Map // user id -> generation in progress
+
+	archiver archiver
 }
 
 // ---------------------------------------------------------------- messages
@@ -344,7 +347,11 @@ func (a *App) onGenerate(ctx context.Context, user *User, chatID int64, msg *tel
 		return err
 	}
 
-	res, err := a.gen.Run(ctx, d.Kind, d.Skin, d.Model, d.Layers)
+	want := d.Format
+	if d.Kind == kindModel && a.archiver.chat != 0 {
+		want = wantAll // the other format goes to the storage chat right away
+	}
+	res, err := a.gen.Run(ctx, d.Kind, d.Skin, d.Model, d.Layers, want)
 	if err != nil {
 		log.Printf("generate for %d: %v", user.ID, err)
 		failed := textGenFailed
@@ -359,6 +366,9 @@ func (a *App) onGenerate(ctx context.Context, user *User, chatID int64, msg *tel
 		return a.edit(ctx, chatID, status.MessageID, failed, backKeyboard())
 	}
 	c := &Craft{UserID: user.ID, Kind: d.Kind, Title: d.Title, Skin: d.Skin, Model: res.Model, Layers: d.Layers}
+	if d.Kind == kindModel {
+		c.Skin = []byte{} // models are megabytes: only the made files are kept, by file id
+	}
 	if err := a.store.AddCraft(ctx, c); err != nil {
 		return err
 	}
@@ -375,6 +385,9 @@ func (a *App) onGenerate(ctx context.Context, user *User, chatID int64, msg *tel
 		return a.edit(ctx, chatID, status.MessageID, textGenFailed, backKeyboard())
 	}
 	a.deleteMessage(ctx, chatID, status.MessageID)
+	if want == wantAll {
+		a.archiveLater(c.ID, res)
+	}
 	return nil
 }
 
@@ -390,8 +403,19 @@ func (a *App) onDownload(ctx context.Context, user *User, chatID, id int64, form
 		answer(textNotFound)
 		return nil
 	}
+	// Without cached file ids the craft is rendered again, so repeated taps must not pile
+	// up generator jobs.
+	if _, running := a.busy.LoadOrStore(user.ID, true); running {
+		answer(textBusy)
+		return nil
+	}
+	defer a.busy.Delete(user.ID)
 	answer(textSending)
-	if err := a.sendFiles(ctx, chatID, c, format, "«"+c.Title+"»", nil, nil); err != nil {
+	err = a.sendFiles(ctx, chatID, c, format, "«"+c.Title+"»", nil, nil)
+	if errors.Is(err, errNoSource) {
+		return a.send(ctx, chatID, textNoFile, nil)
+	}
+	if err != nil {
 		log.Printf("download %d: %v", id, err)
 		return a.send(ctx, chatID, textGenFailed, backKeyboard())
 	}
@@ -452,9 +476,13 @@ func (a *App) showCard(ctx context.Context, user *User, chatID int64, msg *teleg
 	}
 	kb := cardKeyboard(list, c, offset, total, a.admins[user.ID])
 
+	if c.PreviewFileID == "" && len(c.Skin) == 0 {
+		// A model whose preview has not reached the storage chat (yet): a card without a picture.
+		return a.replace(ctx, chatID, msg, text, kb)
+	}
 	photo, uploaded := tu.FileFromID(c.PreviewFileID), false
 	if c.PreviewFileID == "" {
-		res, err := a.gen.Run(ctx, c.Kind, c.Skin, c.Model, c.Layers)
+		res, err := a.gen.Run(ctx, c.Kind, c.Skin, c.Model, c.Layers, wantPreview)
 		if err != nil {
 			return err
 		}
@@ -500,7 +528,7 @@ func (a *App) sendFiles(ctx context.Context, chatID int64, c *Craft, format, cap
 	} else {
 		if res == nil {
 			var err error
-			if res, err = a.gen.Run(ctx, c.Kind, c.Skin, c.Model, c.Layers); err != nil {
+			if res, err = a.gen.Run(ctx, c.Kind, c.Skin, c.Model, c.Layers, format); err != nil {
 				return err
 			}
 		}
@@ -512,11 +540,7 @@ func (a *App) sendFiles(ctx context.Context, chatID int64, c *Craft, format, cap
 			if format != "png" {
 				break
 			}
-			name := base + ".png"
-			if i > 0 {
-				name = fmt.Sprintf("%s_page%d.png", base, i+1)
-			}
-			files = append(files, tu.File(tu.NameReader(bytes.NewReader(page), name)))
+			files = append(files, tu.File(tu.NameReader(bytes.NewReader(page), pageName(base, i))))
 		}
 	}
 
@@ -544,6 +568,28 @@ func (a *App) sendFiles(ctx context.Context, chatID int64, c *Craft, format, cap
 }
 
 // ---------------------------------------------------------------- helpers
+
+// draftTTL is how long an uploaded skin or model waits for "generate" before it is
+// dropped; a .bbmodel can be megabytes.
+const draftTTL = 24 * time.Hour
+
+// dropStaleDrafts deletes abandoned drafts on start and then every hour.
+func (a *App) dropStaleDrafts(ctx context.Context) {
+	tick := time.NewTicker(time.Hour)
+	defer tick.Stop()
+	for {
+		if n, err := a.store.DeleteDraftsBefore(ctx, time.Now().Add(-draftTTL)); err != nil {
+			log.Printf("drop stale drafts: %v", err)
+		} else if n > 0 {
+			log.Printf("dropped %d stale draft(s)", n)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
+}
 
 func (a *App) sendMessage(ctx context.Context, chatID int64, text string, kb *telego.InlineKeyboardMarkup) (*telego.Message, error) {
 	p := tu.Message(tu.ID(chatID), text)
@@ -605,6 +651,14 @@ func cleanTitle(title string) string {
 		title = "Скин"
 	}
 	return title
+}
+
+// pageName is the file name of PNG page i (from 0).
+func pageName(base string, i int) string {
+	if i == 0 {
+		return base + ".png"
+	}
+	return fmt.Sprintf("%s_page%d.png", base, i+1)
 }
 
 // fileBase makes a title safe for a file name.

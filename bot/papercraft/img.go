@@ -120,6 +120,13 @@ func PasteMask(dst *Img, src *Img, x, y int, mask *Gray) {
 				continue
 			}
 			m := uint32(mask.Pix[sy*mask.Stride+sx])
+			switch m {
+			case 0: // the blend below leaves dst as it is
+				continue
+			case 255: // and copies src
+				copy(dst.Pix[di:di+4], src.Pix[si:si+4])
+				continue
+			}
 			for k := 0; k < 4; k++ {
 				dst.Pix[di+k] = uint8((uint32(src.Pix[si+k])*m + uint32(dst.Pix[di+k])*(255-m) + 127) / 255)
 			}
@@ -222,17 +229,52 @@ func Rotate90(im *Img, n int) *Img {
 	}
 	ow, oh := out.Rect.Dx(), out.Rect.Dy()
 	for y := 0; y < oh; y++ {
-		for x := 0; x < ow; x++ {
-			var sx, sy int
-			switch n {
-			case 1: // CCW: dst(x, y) comes from src(w-1-y, x)
-				sx, sy = w-1-y, x
-			case 2:
-				sx, sy = w-1-x, h-1-y
-			case 3: // CW: dst(x, y) comes from src(y, h-1-x)
-				sx, sy = y, h-1-x
-			}
-			copy(out.Pix[y*out.Stride+x*4:], im.Pix[sy*im.Stride+sx*4:sy*im.Stride+sx*4+4])
+		row := out.Pix[y*out.Stride : y*out.Stride+ow*4]
+		// Source of dst(0, y) and the step to the source of dst(x+1, y).
+		var si, step int
+		switch n {
+		case 1: // CCW: dst(x, y) comes from src(w-1-y, x)
+			si, step = w-1-y, im.Stride
+			si *= 4
+		case 2:
+			si, step = (h-1-y)*im.Stride+(w-1)*4, -4
+		case 3: // CW: dst(x, y) comes from src(y, h-1-x)
+			si, step = (h-1)*im.Stride+y*4, -im.Stride
+		}
+		for x := 0; x < ow*4; x += 4 {
+			p := im.Pix[si : si+4 : si+4]
+			row[x], row[x+1], row[x+2], row[x+3] = p[0], p[1], p[2], p[3]
+			si += step
+		}
+	}
+	return out
+}
+
+// RotateGray90 is Rotate90 for a one-channel image.
+func RotateGray90(im *Gray, n int) *Gray {
+	n = ((n % 4) + 4) % 4
+	w, h := im.Rect.Dx(), im.Rect.Dy()
+	out := image.NewGray(image.Rect(0, 0, w, h))
+	if n%2 == 1 {
+		out = image.NewGray(image.Rect(0, 0, h, w))
+	}
+	ow, oh := out.Rect.Dx(), out.Rect.Dy()
+	for y := 0; y < oh; y++ {
+		row := out.Pix[y*out.Stride : y*out.Stride+ow]
+		var si, step int
+		switch n {
+		case 0:
+			si, step = y*im.Stride, 1
+		case 1:
+			si, step = w-1-y, im.Stride
+		case 2:
+			si, step = (h-1-y)*im.Stride+w-1, -1
+		case 3:
+			si, step = (h-1)*im.Stride+y, -im.Stride
+		}
+		for x := range row {
+			row[x] = im.Pix[si]
+			si += step
 		}
 	}
 	return out
