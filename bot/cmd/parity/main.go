@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"strings"
 
 	"skinbot/papercraft"
@@ -21,6 +22,7 @@ func main() {
 	layers := flag.String("layers", "separate", "")
 	model := flag.String("model", "auto", "")
 	outDir := flag.String("out-dir", "out", "")
+	cpuProfile := flag.String("cpuprofile", "", "write a CPU profile to this file")
 	flag.Parse()
 	if flag.NArg() != 1 {
 		fmt.Fprintln(os.Stderr, "usage: parity [flags] input")
@@ -34,6 +36,16 @@ func main() {
 	data, err := os.ReadFile(in)
 	if err != nil {
 		panic(err)
+	}
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			panic(err)
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			panic(err)
+		}
+		defer pprof.StopCPUProfile()
 	}
 
 	level := 6

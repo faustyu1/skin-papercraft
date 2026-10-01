@@ -20,8 +20,8 @@ type Generator struct {
 }
 
 type Result struct {
-	PDF      []byte
-	PNGs     [][]byte // one per page
+	PDF      []byte   // only when the PDF was asked for
+	PNGs     [][]byte // one per page, only when PNGs or a preview were asked for
 	Model    string   // steve or alex, as actually used (skins only)
 	Detailed bool     // a Blockbench model has pieces too small to cut out comfortably
 }
@@ -30,15 +30,26 @@ func NewGenerator(credit string, jobs int) *Generator {
 	return &Generator{credit: credit, slots: make(chan struct{}, max(jobs, 1))}
 }
 
+// What a generator run has to produce. Encoding pages is a good part of the work, so only
+// the asked-for format is made, and a preview stops after the first page.
+const (
+	wantPDF     = "pdf"
+	wantPNG     = "png"
+	wantPreview = "preview"
+)
+
+// errEnough stops rendering once a preview has its first page.
+var errEnough = errors.New("enough pages")
+
 // Run makes a papercraft of a craft of either kind.
-func (g *Generator) Run(ctx context.Context, kind string, data []byte, model, layers string) (*Result, error) {
+func (g *Generator) Run(ctx context.Context, kind string, data []byte, model, layers, want string) (*Result, error) {
 	if kind == kindModel {
-		return g.RunModel(ctx, data)
+		return g.RunModel(ctx, data, want)
 	}
-	return g.RunSkin(ctx, data, model, layers)
+	return g.RunSkin(ctx, data, model, layers, want)
 }
 
-func (g *Generator) RunSkin(ctx context.Context, skinPNG []byte, model, layers string) (*Result, error) {
+func (g *Generator) RunSkin(ctx context.Context, skinPNG []byte, model, layers, want string) (*Result, error) {
 	release, err := g.acquire(ctx)
 	if err != nil {
 		return nil, err
@@ -62,8 +73,11 @@ func (g *Generator) RunSkin(ctx context.Context, skinPNG []byte, model, layers s
 	}
 	out := &Result{}
 	pdf := papercraft.NewPdfWriter(300)
-	emit := pageEncoder(ctx, out, pdf, 6)
+	emit := pageEncoder(ctx, out, pdf, want, 6)
 	slim, _, err := papercraft.RenderSkin(skin, 2.5, 300, layers, forceSlim, g.credit, emit)
+	if errors.Is(err, errEnough) {
+		return out, nil
+	}
 	if err != nil {
 		return nil, timeoutErr(ctx, err)
 	}
@@ -71,12 +85,12 @@ func (g *Generator) RunSkin(ctx context.Context, skinPNG []byte, model, layers s
 	if slim {
 		out.Model = "alex"
 	}
-	return out, finishPDF(out, pdf, ctx)
+	return out, finishPDF(out, pdf, want, ctx)
 }
 
 // RunModel turns a Blockbench model into a papercraft. Big models take a while: every
 // pair of cubes that sink into each other is cut apart first.
-func (g *Generator) RunModel(ctx context.Context, model []byte) (*Result, error) {
+func (g *Generator) RunModel(ctx context.Context, model []byte, want string) (*Result, error) {
 	release, err := g.acquire(ctx)
 	if err != nil {
 		return nil, err
@@ -87,13 +101,16 @@ func (g *Generator) RunModel(ctx context.Context, model []byte) (*Result, error)
 	defer cancel()
 	out := &Result{}
 	pdf := papercraft.NewPdfWriter(300)
-	emit := pageEncoder(ctx, out, pdf, 3)
+	emit := pageEncoder(ctx, out, pdf, want, 3)
 	_, log, err := papercraft.RenderModel(model, 8, 300, g.credit, emit)
+	if errors.Is(err, errEnough) {
+		return out, nil
+	}
 	if err != nil {
 		return nil, timeoutErr(ctx, err)
 	}
 	out.Detailed = strings.Contains(log, "too detailed for A4")
-	return out, finishPDF(out, pdf, ctx)
+	return out, finishPDF(out, pdf, want, ctx)
 }
 
 func (g *Generator) acquire(ctx context.Context) (func(), error) {
@@ -105,26 +122,35 @@ func (g *Generator) acquire(ctx context.Context) (func(), error) {
 	}
 }
 
-// pageEncoder turns each finished page into the PNG bytes the bot sends and appends the
+// pageEncoder turns each finished page into the PNG bytes the bot sends or appends the
 // lossless page to the PDF.
-func pageEncoder(ctx context.Context, res *Result, pdf *papercraft.PdfWriter, level int) func(*papercraft.Img) error {
+func pageEncoder(ctx context.Context, res *Result, pdf *papercraft.PdfWriter, want string, level int) func(*papercraft.Img) error {
 	return func(page *papercraft.Img) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
+		if want == wantPDF {
+			pdf.Add(page)
+			return nil
+		}
 		data, err := papercraft.SavePNG(page, 300, level)
 		if err != nil {
 			return err
 		}
 		res.PNGs = append(res.PNGs, data)
-		pdf.Add(page)
+		if want == wantPreview {
+			return errEnough
+		}
 		return nil
 	}
 }
 
-func finishPDF(res *Result, pdf *papercraft.PdfWriter, ctx context.Context) error {
+func finishPDF(res *Result, pdf *papercraft.PdfWriter, want string, ctx context.Context) error {
+	if want != wantPDF {
+		return timeoutErr(ctx, nil)
+	}
 	var buf bytes.Buffer
 	if err := pdf.Write(&buf); err != nil {
 		return err

@@ -98,11 +98,11 @@ func TestGenerator(t *testing.T) {
 	}
 	g := NewGenerator("tg: @faustyu", 2)
 	for _, model := range []string{"auto", "alex"} {
-		res, err := g.Run(context.Background(), kindSkin, skin, model, "separate")
+		res, err := g.Run(context.Background(), kindSkin, skin, model, "separate", wantPDF)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.HasPrefix(res.PDF, []byte("%PDF")) || len(res.PNGs) == 0 {
+		if !bytes.HasPrefix(res.PDF, []byte("%PDF")) || len(res.PNGs) != 0 {
 			t.Fatalf("bad output for %s", model)
 		}
 		want := map[string]string{"auto": "steve", "alex": "alex"}[model]
@@ -110,6 +110,16 @@ func TestGenerator(t *testing.T) {
 			t.Fatalf("model %s: got %s", model, res.Model)
 		}
 	}
+	res, err := g.Run(context.Background(), kindSkin, skin, "auto", "separate", wantPNG)
+	if err != nil || len(res.PNGs) == 0 || res.PDF != nil {
+		t.Fatalf("png run: %v", err)
+	}
+	pages := len(res.PNGs)
+	res, err = g.Run(context.Background(), kindSkin, skin, "auto", "separate", wantPreview)
+	if err != nil || len(res.PNGs) != 1 || res.PDF != nil {
+		t.Fatalf("preview run: %v", err)
+	}
+	t.Logf("%d png page(s)", pages)
 }
 
 // testModel returns the smallest .bbmodel next to the bot, to keep the test fast.
@@ -134,12 +144,19 @@ func TestModelGenerator(t *testing.T) {
 		t.Fatalf("test model rejected: %d %v", n, err)
 	}
 	g := NewGenerator("tg: @faustyu", 2)
-	res, err := g.Run(context.Background(), kindModel, model, "", "")
+	res, err := g.Run(context.Background(), kindModel, model, "", "", wantPNG)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.HasPrefix(res.PDF, []byte("%PDF")) || len(res.PNGs) < 2 {
+	if len(res.PNGs) < 2 {
 		t.Fatalf("bad output: %d page(s)", len(res.PNGs))
+	}
+	res, err = g.Run(context.Background(), kindModel, model, "", "", wantPDF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(res.PDF, []byte("%PDF")) {
+		t.Fatal("bad pdf")
 	}
 }
 

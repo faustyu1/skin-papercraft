@@ -344,7 +344,7 @@ func (a *App) onGenerate(ctx context.Context, user *User, chatID int64, msg *tel
 		return err
 	}
 
-	res, err := a.gen.Run(ctx, d.Kind, d.Skin, d.Model, d.Layers)
+	res, err := a.gen.Run(ctx, d.Kind, d.Skin, d.Model, d.Layers, d.Format)
 	if err != nil {
 		log.Printf("generate for %d: %v", user.ID, err)
 		failed := textGenFailed
@@ -461,7 +461,7 @@ func (a *App) showCard(ctx context.Context, user *User, chatID int64, msg *teleg
 
 	photo, uploaded := tu.FileFromID(c.PreviewFileID), false
 	if c.PreviewFileID == "" {
-		res, err := a.gen.Run(ctx, c.Kind, c.Skin, c.Model, c.Layers)
+		res, err := a.gen.Run(ctx, c.Kind, c.Skin, c.Model, c.Layers, wantPreview)
 		if err != nil {
 			return err
 		}
@@ -507,7 +507,7 @@ func (a *App) sendFiles(ctx context.Context, chatID int64, c *Craft, format, cap
 	} else {
 		if res == nil {
 			var err error
-			if res, err = a.gen.Run(ctx, c.Kind, c.Skin, c.Model, c.Layers); err != nil {
+			if res, err = a.gen.Run(ctx, c.Kind, c.Skin, c.Model, c.Layers, format); err != nil {
 				return err
 			}
 		}

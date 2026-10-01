@@ -1,37 +1,91 @@
 package papercraft
 
 import (
-	"math/big"
+	"math/bits"
 )
 
 // Free space is tracked on a coarse grid; each grid row is a bitmask, cell x is bit x.
 
+// Bits is a row of grid cells, bit x of word x/64 is cell x.
+type Bits []uint64
+
+func newBits(n int) Bits { return make(Bits, (n+63)/64) }
+
+func (b Bits) bit(i int) bool {
+	return i/64 < len(b) && b[i/64]>>(i%64)&1 == 1
+}
+
+func (b Bits) set(i int) { b[i/64] |= 1 << (i % 64) }
+
+func (b Bits) empty() bool {
+	for _, w := range b {
+		if w != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// orShifted sets dst |= src >> k (k may be negative for a left shift); bits past the end of
+// dst are dropped.
+func orShifted(dst, src Bits, k int) {
+	if k < 0 {
+		k = -k
+		ws, bs := k/64, uint(k%64)
+		for i := len(dst) - 1; i >= ws; i-- {
+			j := i - ws
+			var v uint64
+			if j < len(src) {
+				v = src[j] << bs
+			}
+			if bs != 0 && j-1 >= 0 && j-1 < len(src) {
+				v |= src[j-1] >> (64 - bs)
+			}
+			dst[i] |= v
+		}
+		return
+	}
+	ws, bs := k/64, uint(k%64)
+	for i := range dst {
+		j := i + ws
+		if j >= len(src) {
+			break
+		}
+		v := src[j] >> bs
+		if bs != 0 && j+1 < len(src) {
+			v |= src[j+1] << (64 - bs)
+		}
+		dst[i] |= v
+	}
+}
+
 // CellRows marks the grid cells that any non-zero mask pixel touches.
-func CellRows(mask *Gray, cell int) ([]*big.Int, int, int) {
+func CellRows(mask *Gray, cell int) ([]Bits, int, int) {
 	mw, mh := mask.Rect.Dx(), mask.Rect.Dy()
 	w := (mw + cell - 1) / cell
 	h := (mh + cell - 1) / cell
-	rows := make([]*big.Int, h)
+	rows := make([]Bits, h)
+	sums := make([]int, w)
+	counts := make([]int, w)
 	for cy := 0; cy < h; cy++ {
-		row := new(big.Int)
-		for cx := 0; cx < w; cx++ {
-			sum, n := 0, 0
-			for y := 0; y < cell; y++ {
-				yy := cy*cell + y
-				if yy >= mh {
-					break
+		clear(sums)
+		clear(counts)
+		for yy := cy * cell; yy < min((cy+1)*cell, mh); yy++ {
+			line := mask.Pix[yy*mask.Stride : yy*mask.Stride+mw]
+			for cx := range w {
+				part := line[cx*cell : min((cx+1)*cell, mw)]
+				sum := 0
+				for _, v := range part {
+					sum += int(v)
 				}
-				for x := 0; x < cell; x++ {
-					xx := cx*cell + x
-					if xx >= mw {
-						break
-					}
-					sum += int(mask.Pix[yy*mask.Stride+xx])
-					n++
-				}
+				sums[cx] += sum
+				counts[cx] += len(part)
 			}
-			if sum*2 >= n { // Image.reduce rounds; anything roundable to 1 is taken
-				row.SetBit(row, cx, 1)
+		}
+		row := newBits(w)
+		for cx := range w {
+			if sums[cx]*2 >= counts[cx] { // Image.reduce rounds; anything roundable to 1 is taken
+				row.set(cx)
 			}
 		}
 		rows[cy] = row
@@ -40,45 +94,52 @@ func CellRows(mask *Gray, cell int) ([]*big.Int, int, int) {
 }
 
 // Dilate grows a mask by gap cells on every side (it gets 2*gap bigger).
-func Dilate(rows []*big.Int, w, h, gap int) ([]*big.Int, int, int) {
-	grown := make([]*big.Int, 0, len(rows)+2*gap)
+func Dilate(rows []Bits, w, h, gap int) ([]Bits, int, int) {
+	width := w + 2*gap
+	grown := make([]Bits, 0, len(rows)+2*gap)
 	for _, r := range rows {
-		v := new(big.Int).Lsh(r, uint(gap))
+		v := newBits(width)
+		orShifted(v, r, -gap)
+		t := newBits(width)
 		for i := 0; i < gap; i++ {
-			t := new(big.Int)
-			t.Lsh(v, 1)
-			t.Or(t, new(big.Int).Rsh(v, 1))
-			v.Or(v, t)
+			clear(t)
+			orShifted(t, v, -1)
+			orShifted(t, v, 1)
+			for k := range v {
+				v[k] |= t[k]
+			}
 		}
 		grown = append(grown, v)
 	}
 	for i := 0; i < gap; i++ {
-		grown = append(grown, new(big.Int))
+		grown = append(grown, newBits(width))
 	}
-	out := make([]*big.Int, len(grown))
+	out := make([]Bits, len(grown))
 	for i := range grown {
-		v := new(big.Int)
+		v := newBits(width)
 		for j := max(0, i-gap); j < min(len(grown), i+gap+1); j++ {
-			v.Or(v, grown[j])
+			for k := range v {
+				v[k] |= grown[j][k]
+			}
 		}
 		out[i] = v
 	}
-	return out, w + 2*gap, h + 2*gap
+	return out, width, h + 2*gap
 }
 
 // Run is a run of set bits: first bit and length.
 type Run struct{ Bit, Len int }
 
-func Runs(row *big.Int) []Run {
+func Runs(row Bits) []Run {
 	var out []Run
-	bit, n := 0, row.BitLen()
-	for bit < n {
-		if row.Bit(bit) == 0 {
+	n := len(row) * 64
+	for bit := 0; bit < n; {
+		if !row.bit(bit) {
 			bit++
 			continue
 		}
 		start := bit
-		for bit < n && row.Bit(bit) == 1 {
+		for bit < n && row.bit(bit) {
 			bit++
 		}
 		out = append(out, Run{start, bit - start})
@@ -86,87 +147,137 @@ func Runs(row *big.Int) []Run {
 	return out
 }
 
-// smear ORs v >> k for k in 0..n-1, in log(n) steps.
-func smear(v *big.Int, n int) {
-	for done := 1; done < n; {
-		step := min(done, n-done)
-		v.Or(v, new(big.Int).Rsh(v, uint(step)))
-		done += step
+// Shape is a sprite's footprint on the grid, grown by the gap.
+type Shape struct {
+	Rows  []Bits
+	W, H  int
+	lines []shapeLine // non-empty rows
+}
+
+type shapeLine struct {
+	i    int
+	runs []Run
+}
+
+func newShape(alpha *Gray, cell, gap int) *Shape {
+	rows, w, h := CellRows(alpha, cell)
+	rows, w, h = Dilate(rows, w, h, gap)
+	s := &Shape{Rows: rows, W: w, H: h}
+	for i, r := range rows {
+		if !r.empty() {
+			s.lines = append(s.lines, shapeLine{i, Runs(r)})
+		}
 	}
+	return s
 }
 
 // FirstFit finds the top-most, then left-most spot where the piece overlaps nothing.
-func FirstFit(occ []*big.Int, gridW, gridH int, rows []*big.Int, w, h int) (int, int, bool) {
-	if w > gridW || h > gridH {
+func FirstFit(occ []Bits, gridW, gridH int, s *Shape) (int, int, bool) {
+	if s.W > gridW || s.H > gridH {
 		return 0, 0, false
 	}
-	xs := new(big.Int).Lsh(big.NewInt(1), uint(gridW-w+1))
-	xs.Sub(xs, big.NewInt(1))
-
-	type shapeRow struct {
-		i    int
-		runs []Run
+	nx := gridW - s.W + 1 // x positions to try: bits 0..nx-1
+	words := (nx + 63) / 64
+	xs := make(Bits, words)
+	for i := range xs {
+		xs[i] = ^uint64(0)
 	}
-	var shape []shapeRow
-	for i, r := range rows {
-		if r.Sign() != 0 {
-			shape = append(shape, shapeRow{i, Runs(r)})
-		}
+	if r := nx % 64; r != 0 {
+		xs[words-1] = 1<<r - 1
 	}
-	for y := 0; y <= gridH-h; y++ {
-		blocked := new(big.Int)
-		for _, sr := range shape {
-			o := occ[y+sr.i]
-			for _, run := range sr.runs {
-				t := new(big.Int).Rsh(o, uint(run.Bit))
-				smear(t, run.Len)
-				blocked.Or(blocked, t)
+	blocked := make(Bits, words)
+	// Smearing pulls bits down from past the tried positions, so t spans the whole row.
+	t := make(Bits, max(words, len(occ[0])))
+	for y := 0; y <= gridH-s.H; y++ {
+		clear(blocked)
+		for _, sl := range s.lines {
+			o := occ[y+sl.i]
+			for _, run := range sl.runs {
+				// Cell x is blocked when any occupied cell lies in x+run.Bit .. x+run.Bit+run.Len-1.
+				clear(t)
+				orShifted(t, o, run.Bit)
+				for done := 1; done < run.Len; {
+					step := min(done, run.Len-done)
+					orShifted(t, t, step)
+					done += step
+				}
+				for k := range blocked {
+					blocked[k] |= t[k]
+				}
 			}
-			if blocked.Cmp(xs) == 0 {
+			full := true
+			for k := range blocked {
+				if blocked[k]&xs[k] != xs[k] {
+					full = false
+					break
+				}
+			}
+			if full {
 				break
 			}
 		}
-		free := new(big.Int).AndNot(xs, blocked)
-		if free.Sign() != 0 {
-			x := 0
-			for free.Bit(x) == 0 {
-				x++
+		for k := range xs {
+			if free := xs[k] &^ blocked[k]; free != 0 {
+				return k*64 + bits.TrailingZeros64(free), y, true
 			}
-			return x, y, true
 		}
 	}
 	return 0, 0, false
 }
 
+// Packer places sprites onto pages. Each sprite's footprint is worked out once, however
+// many pages it is tried on.
+type Packer struct {
+	cell, gap int
+	shapes    map[*Img]*[2]*Shape // upright and turned a quarter
+}
+
+func NewPacker(cell, gap int) *Packer {
+	return &Packer{cell: cell, gap: gap, shapes: map[*Img]*[2]*Shape{}}
+}
+
+func (p *Packer) shape(sprite *Img) *[2]*Shape {
+	s := p.shapes[sprite]
+	if s == nil {
+		alpha := GrayAlpha(sprite)
+		s = &[2]*Shape{newShape(alpha, p.cell, p.gap), newShape(RotateGray90(alpha, 1), p.cell, p.gap)}
+		p.shapes[sprite] = s
+	}
+	return s
+}
+
 // Pack places sprites into free space of page; it returns the sprites that did not fit.
-func Pack(page *Img, occ []*big.Int, sprites []*Img, cell, gap int) []*Img {
+func (p *Packer) Pack(page *Img, occ []Bits, sprites []*Img) []*Img {
+	cell, gap := p.cell, p.gap
 	gridW := (page.Rect.Dx() + cell - 1) / cell
 	gridH := len(occ)
 	var left []*Img
 	for _, sprite := range sprites {
-		var bestX, bestY int
-		var bestImg *Img
-		var bestRows []*big.Int
+		var bestX, bestY, bestTurn int
 		found := false
-		for _, img := range []*Img{sprite, Rotate90(sprite, 1)} {
-			rows, w, h := CellRows(GrayAlpha(img), cell)
-			rows, w, h = Dilate(rows, w, h, gap)
-			x, y, ok := FirstFit(occ, gridW, gridH, rows, w, h)
+		shapes := p.shape(sprite)
+		for turn, s := range shapes {
+			x, y, ok := FirstFit(occ, gridW, gridH, s)
 			if !ok {
 				continue
 			}
 			if !found || y < bestY || (y == bestY && x < bestX) {
-				bestX, bestY, bestImg, bestRows, found = x, y, img, rows, true
+				bestX, bestY, bestTurn, found = x, y, turn, true
 			}
 		}
 		if !found {
 			left = append(left, sprite)
 			continue
 		}
+		delete(p.shapes, sprite)
+		img := sprite
+		if bestTurn == 1 {
+			img = Rotate90(sprite, 1)
+		}
 		x, y := bestX+gap, bestY+gap
-		PasteMask(page, bestImg, x*cell, y*cell, GrayAlpha(bestImg))
-		for i, row := range bestRows {
-			occ[y+i].Or(occ[y+i], new(big.Int).Lsh(row, uint(x)))
+		PasteMask(page, img, x*cell, y*cell, GrayAlpha(img))
+		for i, row := range shapes[bestTurn].Rows {
+			orShifted(occ[y+i], row, -x)
 		}
 	}
 	return left

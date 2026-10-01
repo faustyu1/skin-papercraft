@@ -110,9 +110,18 @@ func joinStrings(ss []string, sep string) string {
 	return b.String()
 }
 
-// SavePNG encodes the image with the given compression level and DPI metadata.
+// SavePNG encodes the image with the given zlib compression level (1-9) and DPI metadata.
 func SavePNG(im *Img, dpi, level int) ([]byte, error) {
-	enc := png.Encoder{CompressionLevel: png.CompressionLevel(level)}
+	// image/png only knows its own named levels and treats any other number as the
+	// default, so map zlib levels onto them.
+	cl := png.DefaultCompression
+	switch {
+	case level <= 3:
+		cl = png.BestSpeed
+	case level >= 9:
+		cl = png.BestCompression
+	}
+	enc := png.Encoder{CompressionLevel: cl}
 	var buf bytes.Buffer
 	if err := enc.Encode(&buf, im); err != nil {
 		return nil, err
