@@ -161,10 +161,10 @@ func planesIn(e, other *Element) []Plane {
 	return planes
 }
 
-// SolidPlanes returns face planes of other's current solid in e's coordinates.
-func solidPlanes(e, other *Element) []Plane {
+// partPlanes returns the face planes of one part of other in e's coordinates.
+func partPlanes(e, other *Element, part Solid) []Plane {
 	var planes []Plane
-	for _, f := range other.Solid {
+	for _, f := range part {
 		p0 := e.toLocal(other.toWorld(f.Pts[0]))
 		q := e.toLocal(other.toWorld(vAdd(f.Pts[0], f.N)))
 		planes = append(planes, Plane{p0, vUnit(vSub(q, p0))})
@@ -172,15 +172,85 @@ func solidPlanes(e, other *Element) []Plane {
 	return planes
 }
 
-func overlapVolume(a, b *Element) float64 {
-	inside := a.Solid
-	for _, pl := range solidPlanes(a, b) {
-		inside = Clip(inside, pl.P0, pl.N, 1e-5)
-		if len(inside) == 0 {
+// insideVolume is the volume of the part of s behind all the planes.
+func insideVolume(s Solid, planes []Plane) float64 {
+	for _, pl := range planes {
+		if len(s) == 0 {
 			return 0
 		}
+		s = Clip(s, pl.P0, pl.N, 1e-5)
 	}
-	return solidVolume(inside)
+	if len(s) == 0 {
+		return 0
+	}
+	return solidVolume(s)
+}
+
+func overlapVolume(a, b *Element) float64 {
+	total := 0.0
+	for _, pa := range a.parts {
+		for _, pb := range b.parts {
+			total += insideVolume(pa, partPlanes(a, b, pb))
+		}
+	}
+	return total
+}
+
+// Piece is a convex part of a cube or a flat cube, and the plane it was cut off along.
+type piece struct {
+	S     Solid
+	Plane Plane
+	Cut   bool // false for a part nothing was cut off
+}
+
+// subtract splits the convex s into the convex parts that lie outside the convex region
+// behind planes (outward normals). The region is taken away exactly: the parts are what
+// is in front of one plane and behind the planes used before it, biggest first. A flat
+// cube is a single face here, measured by area.
+func subtract(s Solid, planes []Plane, size func(Solid) float64) []piece {
+	var out []piece
+	rest := s
+	left := append([]Plane(nil), planes...)
+	for len(left) > 0 && len(rest) > 0 {
+		best, bestSize := -1, 0.0
+		var bestOut Solid
+		for i, pl := range left {
+			o := Clip(rest, pl.P0, vMul(pl.N, -1), 1e-5)
+			if len(o) == 0 {
+				continue
+			}
+			if sz := size(o); best < 0 || sz > bestSize {
+				best, bestSize, bestOut = i, sz, o
+			}
+		}
+		if best < 0 {
+			break // what is left lies inside the region
+		}
+		out = append(out, piece{bestOut, left[best], true})
+		rest = Clip(rest, left[best].P0, left[best].N, 1e-5)
+		left = append(left[:best], left[best+1:]...)
+	}
+	return out
+}
+
+func faceArea(s Solid) float64 {
+	if len(s) == 0 {
+		return 0
+	}
+	return PolyArea(s[0].Pts, s[0].N)
+}
+
+// thickness is about the smallest width of a convex solid: 2·volume/surface, which is
+// the thin side of a slab.
+func thickness(s Solid) float64 {
+	area := 0.0
+	for _, f := range s {
+		area += PolyArea(f.Pts, f.N)
+	}
+	if area == 0 {
+		return 0
+	}
+	return 2 * solidVolume(s) / area
 }
 
 func flatAxes(e *Element, thin float64) []int {
@@ -217,6 +287,43 @@ func equalPoly(a []V3, b []V3) bool {
 	return true
 }
 
+// cutAway takes by's parts out of cut's parts. Parts too small or too thin to make a
+// paper piece of are dropped; it returns the parts left and the volume dropped.
+func cutAway(cut, by *Element, thin float64) ([]Solid, float64) {
+	var parts []Solid
+	for _, p := range cut.parts {
+		pieces := []Solid{p}
+		for _, q := range by.parts {
+			planes := partPlanes(cut, by, q)
+			var next []Solid
+			for _, pc := range pieces {
+				if insideVolume(pc, planes) <= 1e-6*cut.Full {
+					next = append(next, pc)
+					continue
+				}
+				for _, sp := range subtract(pc, planes, solidVolume) {
+					next = append(next, sp.S)
+				}
+			}
+			pieces = next
+		}
+		parts = append(parts, pieces...)
+	}
+	sort.SliceStable(parts, func(i, j int) bool { return solidVolume(parts[i]) > solidVolume(parts[j]) })
+	var kept []Solid
+	lost := 0.0
+	scrap := 0.04 * math.Min(cut.Full, by.Full)
+	for i, p := range parts {
+		v := solidVolume(p)
+		if i > 0 && (v < scrap || thickness(p) < 2*thin) {
+			lost += v
+			continue
+		}
+		kept = append(kept, p)
+	}
+	return kept, lost
+}
+
 // ResolveOverlaps cuts cubes apart wherever they sink into each other, so paper pieces
 // never collide. Returns buried pieces.
 func resolveOverlaps(elements []*Element, thin float64) []*Element {
@@ -227,11 +334,11 @@ func resolveOverlaps(elements []*Element, thin float64) []*Element {
 		}
 	}
 	for _, e := range elements {
-		e.Cut, e.PlaneCut, e.Glued = nil, nil, nil
+		e.Cut, e.Extra, e.PlaneCuts, e.parts = nil, nil, nil, nil
 	}
 	for _, e := range solids {
 		e.Solid = boxSolid(e)
-		e.Glued = nil
+		e.parts = []Solid{e.Solid}
 		e.Full = solidVolume(e.Solid)
 	}
 	type pair struct {
@@ -252,6 +359,7 @@ func resolveOverlaps(elements []*Element, thin float64) []*Element {
 	sort.SliceStable(pairs, func(i, j int) bool { return pairs[i].v > pairs[j].v })
 
 	buried := map[*Element]bool{}
+	cutDone := map[*Element]bool{}
 	for _, p := range pairs {
 		a, b := p.a, p.b
 		if buried[a] || buried[b] {
@@ -260,36 +368,39 @@ func resolveOverlaps(elements []*Element, thin float64) []*Element {
 		if overlapVolume(a, b) <= 1e-4*math.Min(a.Full, b.Full) {
 			continue // an earlier cut already took the shared part away
 		}
-		var bestRemoved float64
-		var bestCut, bestBy *Element
-		var bestKept Solid
-		first := true
+		// Take the shared part out of one of the two, whole, so the finished model has
+		// no holes. Pick the side that loses the least to scraps too small to cut out and
+		// splits into the fewest extra pieces; on a tie, the smaller cube gives way.
+		var bestCut *Element
+		var bestParts []Solid
+		bestCost := math.Inf(1)
 		for _, cp := range [][2]*Element{{a, b}, {b, a}} {
 			cut, by := cp[0], cp[1]
-			before := solidVolume(cut.Solid)
-			for _, pl := range solidPlanes(cut, by) {
-				kept := Clip(cut.Solid, pl.P0, vMul(pl.N, -1), 1e-5)
-				removed := before
-				if len(kept) > 0 {
-					removed -= solidVolume(kept)
-				}
-				if first || removed < bestRemoved {
-					first = false
-					bestRemoved, bestCut, bestBy, bestKept = removed, cut, by, kept
-				}
+			parts, lost := cutAway(cut, by, thin)
+			cost := lost/math.Min(a.Full, b.Full) + 0.05*float64(len(parts)-len(cut.parts))
+			if len(parts) == 0 {
+				cost = 1 // swallowed whole
+			}
+			if cost < bestCost-1e-9 || (math.Abs(cost-bestCost) <= 1e-9 && cut.Full < bestCut.Full) {
+				bestCost, bestCut, bestParts = cost, cut, parts
 			}
 		}
-		_ = bestBy
-		if len(bestKept) == 0 || solidVolume(bestKept) < 0.02*bestCut.Full {
+		left := 0.0
+		for _, s := range bestParts {
+			left += solidVolume(s)
+		}
+		if left < 0.02*bestCut.Full {
 			buried[bestCut] = true
 			continue
 		}
-		bestCut.Solid = bestKept
-		bestCut.Glued = append(bestCut.Glued, bestBy)
+		bestCut.parts = bestParts
+		cutDone[bestCut] = true
 	}
 	for _, e := range solids {
-		if len(e.Glued) > 0 {
+		if cutDone[e] && !buried[e] {
+			e.Solid = e.parts[0]
 			e.Cut = &e.Solid
+			e.Extra = e.parts[1:]
 		}
 	}
 
@@ -302,52 +413,70 @@ func resolveOverlaps(elements []*Element, thin float64) []*Element {
 		corners := e.faceCorners()
 		tl, tr, bl := corners[first][0], corners[first][1], corners[first][2]
 		br := vAdd(tr, vSub(bl, tl))
-		face := Solid{&SolidFace{Pts: []V3{tl, tr, br, bl}, N: faceNormals[first], Src: first, HasSrc: true}}
-		full := PolyArea(face[0].Pts, face[0].N)
-		var glue [2]V3
-		hasGlue := false
+		whole := Solid{&SolidFace{Pts: []V3{tl, tr, br, bl}, N: faceNormals[first], Src: first, HasSrc: true}}
+		full := faceArea(whole)
+		// A flat cube that solid cubes pierce keeps everything around them, in convex
+		// parts glued on along the line where they meet a cube.
+		pieces := []piece{{S: whole}}
+		touched := false
 		for _, s := range solids {
 			if buried[s] || !boxesTouch(e, s) {
 				continue
 			}
-			pls := solidPlanes(e, s)
-			inside := face
-			for _, pl := range pls {
-				inside = Clip(inside, pl.P0, pl.N, 1e-5)
-			}
-			if len(inside) == 0 || PolyArea(inside[0].Pts, face[0].N) < 1e-4*full {
-				continue
-			}
-			var kept Solid
-			var p0, n V3
-			bestArea := -1.0
-			for _, pl := range pls {
-				c := Clip(face, pl.P0, vMul(pl.N, -1), 1e-5)
-				area := 0.0
-				if len(c) > 0 {
-					area = PolyArea(c[0].Pts, face[0].N)
+			for _, q := range s.parts {
+				planes := partPlanes(e, s, q)
+				var next []piece
+				for _, pc := range pieces {
+					in := pc.S
+					for _, pl := range planes {
+						if len(in) == 0 {
+							break
+						}
+						in = Clip(in, pl.P0, pl.N, 1e-5)
+					}
+					if len(in) == 0 || faceArea(in) < 1e-4*full {
+						next = append(next, pc)
+						continue
+					}
+					touched = true
+					next = append(next, subtract(pc.S, planes, faceArea)...)
 				}
-				if area > bestArea {
-					bestArea, p0, n, kept = area, pl.P0, pl.N, c
-				}
-			}
-			if len(kept) == 0 || PolyArea(kept[0].Pts, face[0].N) < 0.05*full {
-				buried[e] = true
-				break
-			}
-			face = kept[:1]
-			var edge []V3
-			for _, q := range face[0].Pts {
-				if math.Abs(vDot(n, vSub(q, p0))) < 1e-6 {
-					edge = append(edge, q)
-				}
-			}
-			if len(edge) >= 2 {
-				glue, hasGlue = [2]V3{edge[0], edge[len(edge)-1]}, true
+				pieces = next
 			}
 		}
-		if !buried[e] && !equalPoly(face[0].Pts, []V3{tl, tr, br, bl}) {
-			e.PlaneCut = &PlaneCut{Poly: face[0].Pts, Glue: glue, HasGlue: hasGlue}
+		if !touched {
+			continue
+		}
+		sort.SliceStable(pieces, func(i, j int) bool { return faceArea(pieces[i].S) > faceArea(pieces[j].S) })
+		var cuts []PlaneCut
+		for i, pc := range pieces {
+			area := faceArea(pc.S)
+			if i > 0 && area < 0.05*full {
+				continue
+			}
+			if i == 0 && area < 0.05*full {
+				break
+			}
+			c := PlaneCut{Poly: pc.S[0].Pts}
+			if pc.Cut {
+				var edge []V3
+				for _, q := range c.Poly {
+					if math.Abs(vDot(pc.Plane.N, vSub(q, pc.Plane.P0))) < 1e-6 {
+						edge = append(edge, q)
+					}
+				}
+				if len(edge) >= 2 {
+					c.Glue, c.HasGlue = [2]V3{edge[0], edge[len(edge)-1]}, true
+				}
+			}
+			cuts = append(cuts, c)
+		}
+		if len(cuts) == 0 {
+			buried[e] = true
+			continue
+		}
+		if len(cuts) > 1 || !equalPoly(cuts[0].Poly, []V3{tl, tr, br, bl}) {
+			e.PlaneCuts = cuts
 		}
 	}
 	var out []*Element

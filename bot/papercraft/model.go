@@ -69,16 +69,17 @@ type Element struct {
 
 	Groups []*Group
 
-	xf       *Transform
-	wb       [2]V3
-	hasWB    bool
-	Solid    Solid
-	Cut      *Solid // set when the cube was cut apart from its neighbours
-	Glued    []*Element
-	PlaneCut *PlaneCut // a flat cube trimmed along a neighbour's face
-	Over     *Element  // see-through outer layer wraps this cube
-	Full     float64
-	Buried   bool
+	xf        *Transform
+	wb        [2]V3
+	hasWB     bool
+	Solid     Solid
+	Cut       *Solid     // set when the cube was cut apart from its neighbours
+	Extra     []Solid    // more parts of a cut cube, printed as pieces of their own
+	parts     []Solid    // all parts while cubes are being cut apart
+	PlaneCuts []PlaneCut // what is left of a flat cube that neighbours cut through
+	Over      *Element   // see-through outer layer wraps this cube
+	Full      float64
+	Buried    bool
 }
 
 // Transform is a rotation and offset: world = M·p + T.
