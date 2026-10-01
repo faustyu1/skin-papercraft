@@ -36,6 +36,7 @@ const (
 	wantPDF     = "pdf"
 	wantPNG     = "png"
 	wantPreview = "preview"
+	wantAll     = "all" // PDF and PNG pages both, for the storage chat
 )
 
 // errEnough stops rendering once a preview has its first page.
@@ -43,6 +44,9 @@ var errEnough = errors.New("enough pages")
 
 // Run makes a papercraft of a craft of either kind.
 func (g *Generator) Run(ctx context.Context, kind string, data []byte, model, layers, want string) (*Result, error) {
+	if len(data) == 0 {
+		return nil, errNoSource
+	}
 	if kind == kindModel {
 		return g.RunModel(ctx, data, want)
 	}
@@ -131,8 +135,10 @@ func pageEncoder(ctx context.Context, res *Result, pdf *papercraft.PdfWriter, wa
 			return ctx.Err()
 		default:
 		}
-		if want == wantPDF {
+		if want == wantPDF || want == wantAll {
 			pdf.Add(page)
+		}
+		if want == wantPDF {
 			return nil
 		}
 		data, err := papercraft.SavePNG(page, 300, level)
@@ -148,7 +154,7 @@ func pageEncoder(ctx context.Context, res *Result, pdf *papercraft.PdfWriter, wa
 }
 
 func finishPDF(res *Result, pdf *papercraft.PdfWriter, want string, ctx context.Context) error {
-	if want != wantPDF {
+	if want != wantPDF && want != wantAll {
 		return timeoutErr(ctx, nil)
 	}
 	var buf bytes.Buffer
@@ -184,6 +190,7 @@ func validSkin(data []byte) bool {
 
 var (
 	errTooSlow     = errors.New("generator timed out")
+	errNoSource    = errors.New("the model was moved to the storage chat, nothing to render")
 	errOutOfMemory = errors.New("generator killed, out of memory")
 )
 

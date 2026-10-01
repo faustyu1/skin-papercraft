@@ -244,6 +244,39 @@ func kindOf(kind string) string {
 	return kind
 }
 
+// DropSource forgets a model craft's .bbmodel once every output of it has a Telegram
+// file id to be sent from instead.
+func (s *Store) DropSource(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE crafts SET skin = x'' WHERE id = ? AND kind = ?
+		AND pdf_file_id != '' AND png_file_ids != '' AND preview_file_id != ''`, id, kindModel)
+	return err
+}
+
+// ModelsWithSource lists the model crafts that still keep their .bbmodel, oldest first.
+func (s *Store) ModelsWithSource(ctx context.Context) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM crafts WHERE kind = ? AND length(skin) > 0 ORDER BY id`, kindModel)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// Vacuum gives the space of deleted data back to the file system; SQLite only reuses it
+// otherwise.
+func (s *Store) Vacuum(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `VACUUM`)
+	return err
+}
+
 func (s *Store) DeleteCraft(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM crafts WHERE id = ?`, id)
 	return err

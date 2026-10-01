@@ -80,6 +80,14 @@ func main() {
 		gen:    NewGenerator(env("CREDIT", "tg: @faustyu"), jobs),
 		admins: admins,
 	}
+	if v := os.Getenv("STORAGE_CHAT_ID"); v != "" {
+		if app.archiver.chat, err = strconv.ParseInt(strings.TrimSpace(v), 10, 64); err != nil {
+			log.Fatalf("STORAGE_CHAT_ID: %v", err)
+		}
+		go app.archiveStored(ctx)
+	} else {
+		log.Println("STORAGE_CHAT_ID is not set, .bbmodel files stay in the database")
+	}
 	bh.HandleMessage(app.onStart, th.CommandEqual("start"))
 	bh.HandleMessage(app.onMessage)
 	bh.HandleCallbackQuery(app.onCallback)

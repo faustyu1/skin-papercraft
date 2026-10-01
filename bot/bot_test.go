@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -196,6 +197,60 @@ func TestStoreKind(t *testing.T) {
 	}
 	if got, _ := s.Craft(ctx, c.ID); got.Kind != kindSkin {
 		t.Fatalf("craft kind defaults to skin: %+v", got)
+	}
+}
+
+func TestStoreDropSource(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenStore(filepath.Join(t.TempDir(), "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	skin := &Craft{UserID: 1, Title: "s", Skin: []byte{1}, Model: "steve", Layers: "none"}
+	model := &Craft{UserID: 1, Kind: kindModel, Title: "m", Skin: []byte("{}")}
+	for _, c := range []*Craft{skin, model} {
+		if err := s.AddCraft(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range []string{"pdf", "png"} {
+			if err := s.SetFileIDs(ctx, c.ID, f, "id"); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if ids, _ := s.ModelsWithSource(ctx); len(ids) != 1 || ids[0] != model.ID {
+		t.Fatalf("models with source: %v", ids)
+	}
+	// No preview yet: the model is still needed.
+	if err := s.DropSource(ctx, model.ID); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := s.Craft(ctx, model.ID); len(c.Skin) == 0 {
+		t.Fatal("dropped a model that still has outputs to upload")
+	}
+	for _, c := range []*Craft{skin, model} {
+		if err := s.SetFileIDs(ctx, c.ID, "preview", "id"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DropSource(ctx, c.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c, _ := s.Craft(ctx, model.ID); len(c.Skin) != 0 {
+		t.Fatal("model kept after upload")
+	}
+	if c, _ := s.Craft(ctx, skin.ID); len(c.Skin) == 0 {
+		t.Fatal("skins are kept")
+	}
+	if ids, _ := s.ModelsWithSource(ctx); len(ids) != 0 {
+		t.Fatalf("models with source after drop: %v", ids)
+	}
+	if err := s.Vacuum(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewGenerator("x", 1).Run(ctx, kindModel, nil, "", "", wantPDF); !errors.Is(err, errNoSource) {
+		t.Fatalf("render without source: %v", err)
 	}
 }
 

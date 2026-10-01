@@ -25,6 +25,8 @@ type App struct {
 	gen    *Generator
 	admins map[int64]bool
 	busy   sync.Map // user id -> generation in progress
+
+	archiver archiver
 }
 
 // ---------------------------------------------------------------- messages
@@ -344,7 +346,11 @@ func (a *App) onGenerate(ctx context.Context, user *User, chatID int64, msg *tel
 		return err
 	}
 
-	res, err := a.gen.Run(ctx, d.Kind, d.Skin, d.Model, d.Layers, d.Format)
+	want := d.Format
+	if d.Kind == kindModel && a.archiver.chat != 0 {
+		want = wantAll // the other format goes to the storage chat right away
+	}
+	res, err := a.gen.Run(ctx, d.Kind, d.Skin, d.Model, d.Layers, want)
 	if err != nil {
 		log.Printf("generate for %d: %v", user.ID, err)
 		failed := textGenFailed
@@ -375,6 +381,9 @@ func (a *App) onGenerate(ctx context.Context, user *User, chatID int64, msg *tel
 		return a.edit(ctx, chatID, status.MessageID, textGenFailed, backKeyboard())
 	}
 	a.deleteMessage(ctx, chatID, status.MessageID)
+	if want == wantAll {
+		a.archiveLater(c.ID, res)
+	}
 	return nil
 }
 
@@ -519,11 +528,7 @@ func (a *App) sendFiles(ctx context.Context, chatID int64, c *Craft, format, cap
 			if format != "png" {
 				break
 			}
-			name := base + ".png"
-			if i > 0 {
-				name = fmt.Sprintf("%s_page%d.png", base, i+1)
-			}
-			files = append(files, tu.File(tu.NameReader(bytes.NewReader(page), name)))
+			files = append(files, tu.File(tu.NameReader(bytes.NewReader(page), pageName(base, i))))
 		}
 	}
 
@@ -612,6 +617,14 @@ func cleanTitle(title string) string {
 		title = "Скин"
 	}
 	return title
+}
+
+// pageName is the file name of PNG page i (from 0).
+func pageName(base string, i int) string {
+	if i == 0 {
+		return base + ".png"
+	}
+	return fmt.Sprintf("%s_page%d.png", base, i+1)
 }
 
 // fileBase makes a title safe for a file name.
