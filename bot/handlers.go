@@ -390,6 +390,13 @@ func (a *App) onDownload(ctx context.Context, user *User, chatID, id int64, form
 		answer(textNotFound)
 		return nil
 	}
+	// Without cached file ids the craft is rendered again, so repeated taps must not pile
+	// up generator jobs.
+	if _, running := a.busy.LoadOrStore(user.ID, true); running {
+		answer(textBusy)
+		return nil
+	}
+	defer a.busy.Delete(user.ID)
 	answer(textSending)
 	if err := a.sendFiles(ctx, chatID, c, format, "«"+c.Title+"»", nil, nil); err != nil {
 		log.Printf("download %d: %v", id, err)
