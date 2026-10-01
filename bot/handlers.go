@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"github.com/mymmrac/telego"
@@ -567,6 +568,28 @@ func (a *App) sendFiles(ctx context.Context, chatID int64, c *Craft, format, cap
 }
 
 // ---------------------------------------------------------------- helpers
+
+// draftTTL is how long an uploaded skin or model waits for "generate" before it is
+// dropped; a .bbmodel can be megabytes.
+const draftTTL = 24 * time.Hour
+
+// dropStaleDrafts deletes abandoned drafts on start and then every hour.
+func (a *App) dropStaleDrafts(ctx context.Context) {
+	tick := time.NewTicker(time.Hour)
+	defer tick.Stop()
+	for {
+		if n, err := a.store.DeleteDraftsBefore(ctx, time.Now().Add(-draftTTL)); err != nil {
+			log.Printf("drop stale drafts: %v", err)
+		} else if n > 0 {
+			log.Printf("dropped %d stale draft(s)", n)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
+}
 
 func (a *App) sendMessage(ctx context.Context, chatID int64, text string, kb *telego.InlineKeyboardMarkup) (*telego.Message, error) {
 	p := tu.Message(tu.ID(chatID), text)

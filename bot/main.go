@@ -96,6 +96,7 @@ func main() {
 		<-ctx.Done()
 		_ = bh.Stop()
 	}()
+	go app.dropStaleDrafts(ctx)
 	log.Println("bot started")
 	if err := bh.Start(); err != nil {
 		log.Printf("bot handler stopped: %v", err)

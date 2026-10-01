@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func testSkin(t *testing.T) []byte {
@@ -251,6 +252,33 @@ func TestStoreDropSource(t *testing.T) {
 	}
 	if _, err := NewGenerator("x", 1).Run(ctx, kindModel, nil, "", "", wantPDF); !errors.Is(err, errNoSource) {
 		t.Fatalf("render without source: %v", err)
+	}
+}
+
+func TestDeleteDraftsBefore(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenStore(filepath.Join(t.TempDir(), "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for _, id := range []int64{1, 2} {
+		if err := s.SaveDraft(ctx, &Draft{UserID: id, Kind: kindModel, Title: "m", Skin: []byte("{}"), Format: "pdf"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE drafts SET updated_at = ? WHERE user_id = 1`,
+		time.Now().Add(-25*time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.DeleteDraftsBefore(ctx, time.Now().Add(-draftTTL)); err != nil || n != 1 {
+		t.Fatalf("deleted %d: %v", n, err)
+	}
+	if d, _ := s.Draft(ctx, 1); d != nil {
+		t.Fatal("stale draft kept")
+	}
+	if d, _ := s.Draft(ctx, 2); d == nil {
+		t.Fatal("fresh draft dropped")
 	}
 }
 

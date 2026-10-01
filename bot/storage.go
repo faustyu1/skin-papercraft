@@ -171,6 +171,15 @@ func (s *Store) DeleteDraft(ctx context.Context, userID int64) error {
 	return err
 }
 
+// DeleteDraftsBefore drops the drafts last touched before t and returns how many.
+func (s *Store) DeleteDraftsBefore(ctx context.Context, t time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM drafts WHERE updated_at < ?`, t.Unix())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (s *Store) AddCraft(ctx context.Context, c *Craft) error {
 	c.CreatedAt = time.Now()
 	res, err := s.db.ExecContext(ctx,
