@@ -15,9 +15,10 @@ import (
 	tu "github.com/mymmrac/telego/telegoutil"
 )
 
-// Blockbench models run to megabytes, so they are not kept: once a model craft is made,
-// its PDF, PNG pages and card preview go to the storage chat, and from then on the craft
-// is sent from those Telegram file ids alone.
+// Blockbench models run to megabytes, so they are not kept. A model is rendered once into
+// every format; the user gets theirs, the rest (PDF, PNG pages, card preview) goes to the
+// storage chat in the background, and from then on the craft is sent from those Telegram
+// file ids alone. Whatever did not make it there is simply not available.
 
 // archiver uploads model crafts to the storage chat one at a time.
 type archiver struct {
@@ -26,12 +27,13 @@ type archiver struct {
 }
 
 // archive uploads whatever outputs of a model craft have no file id yet, then drops the
-// .bbmodel. res may hold the craft rendered with wantAll; otherwise it is rendered again.
+// .bbmodel if the craft still has one. res holds the craft rendered with wantAll; without
+// it only a craft that kept its .bbmodel (made before the storage chat) can be archived.
 func (a *App) archive(ctx context.Context, id int64, res *Result) error {
 	a.archiver.mu.Lock()
 	defer a.archiver.mu.Unlock()
 	c, err := a.store.Craft(ctx, id)
-	if err != nil || c == nil || c.Kind != kindModel || len(c.Skin) == 0 {
+	if err != nil || c == nil || c.Kind != kindModel || (res == nil && len(c.Skin) == 0) {
 		return err
 	}
 	if res == nil && (c.PDFFileID == "" || c.PNGFileIDs == "" || c.PreviewFileID == "") {

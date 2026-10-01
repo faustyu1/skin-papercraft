@@ -103,4 +103,30 @@ func TestArchive(t *testing.T) {
 			t.Fatalf("pdf uploaded again or stray document: %v", api.calls)
 		}
 	}
+
+	// A fresh craft: the model was never stored, the render is handed over instead.
+	res, err := a.gen.Run(ctx, kindModel, model, "", "", wantAll)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := &Craft{UserID: 1, Kind: kindModel, Title: "f", Skin: []byte{}}
+	if err := store.AddCraft(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetFileIDs(ctx, fresh.ID, "png", "user-png"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.archive(ctx, fresh.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := store.Craft(ctx, fresh.ID); got.PDFFileID != "" {
+		t.Fatal("archived without a render or a model")
+	}
+	if err := a.archive(ctx, fresh.ID, res); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = store.Craft(ctx, fresh.ID)
+	if got.PDFFileID == "" || got.PNGFileIDs != "user-png" || got.PreviewFileID != "big" {
+		t.Fatalf("fresh file ids: %+v", got)
+	}
 }

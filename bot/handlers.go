@@ -365,6 +365,9 @@ func (a *App) onGenerate(ctx context.Context, user *User, chatID int64, msg *tel
 		return a.edit(ctx, chatID, status.MessageID, failed, backKeyboard())
 	}
 	c := &Craft{UserID: user.ID, Kind: d.Kind, Title: d.Title, Skin: d.Skin, Model: res.Model, Layers: d.Layers}
+	if d.Kind == kindModel {
+		c.Skin = []byte{} // models are megabytes: only the made files are kept, by file id
+	}
 	if err := a.store.AddCraft(ctx, c); err != nil {
 		return err
 	}
@@ -407,7 +410,11 @@ func (a *App) onDownload(ctx context.Context, user *User, chatID, id int64, form
 	}
 	defer a.busy.Delete(user.ID)
 	answer(textSending)
-	if err := a.sendFiles(ctx, chatID, c, format, "«"+c.Title+"»", nil, nil); err != nil {
+	err = a.sendFiles(ctx, chatID, c, format, "«"+c.Title+"»", nil, nil)
+	if errors.Is(err, errNoSource) {
+		return a.send(ctx, chatID, textNoFile, nil)
+	}
+	if err != nil {
 		log.Printf("download %d: %v", id, err)
 		return a.send(ctx, chatID, textGenFailed, backKeyboard())
 	}
@@ -468,6 +475,10 @@ func (a *App) showCard(ctx context.Context, user *User, chatID int64, msg *teleg
 	}
 	kb := cardKeyboard(list, c, offset, total, a.admins[user.ID])
 
+	if c.PreviewFileID == "" && len(c.Skin) == 0 {
+		// A model whose preview has not reached the storage chat (yet): a card without a picture.
+		return a.replace(ctx, chatID, msg, text, kb)
+	}
 	photo, uploaded := tu.FileFromID(c.PreviewFileID), false
 	if c.PreviewFileID == "" {
 		res, err := a.gen.Run(ctx, c.Kind, c.Skin, c.Model, c.Layers, wantPreview)
